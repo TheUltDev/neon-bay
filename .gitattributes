@@ -1,0 +1,32 @@
+# Normalize line endings in the repository to LF, and check out LF everywhere
+# by default. Without this, a Windows clone with core.autocrlf=true writes CRLF
+# into scripts/*.sh, and they fail on Linux and macOS with a baffling
+# "/usr/bin/env: 'bash\r': No such file or directory".
+* text=auto eol=lf
+
+# Scripts that a POSIX shell must be able to read. Never CRLF.
+*.sh    text eol=lf
+*.mjs   text eol=lf
+*.js    text eol=lf
+
+# Windows-native scripts. CRLF keeps Notepad, ISE and older PowerShell hosts
+# happy; PowerShell itself is fine either way.
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+
+# Never touch these.
+*.wasm  binary
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+
+# Collapse lockfiles in review and keep them out of language statistics, but
+# leave them diffable -- auditing a dependency bump needs the real diff.
+Cargo.lock        linguist-generated
+package-lock.json linguist-generated

@@ -1,0 +1,18 @@
+# The client is a static bundle -- HTML, one JS file, one 38 KB wasm -- so this
+# is an assets-only Worker with no script at all. Cloudflare serves it from
+# every edge; the only thing it talks to is the Railway service, over wss.
+name = "neon-bay"
+compatibility_date = "2026-09-08"
+
+[assets]
+directory = "./dist"
+# Two pages: the game at `/`, the architecture write-up at `/tech`. The latter is
+# `public/tech.html`, which Vite copies through untouched -- `auto-trailing-slash`
+# is what resolves the extensionless request to it, so it has to be explicit here
+# rather than left to the default. Anything that is still not a real file after
+# that is the game, so a deep link into the client does not 404.
+html_handling = "auto-trailing-slash"
+not_found_handling = "single-page-application"
+
+[observability]
+enabled = true

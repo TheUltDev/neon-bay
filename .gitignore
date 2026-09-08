@@ -1,0 +1,9 @@
+/target
+/module/target
+/web/node_modules
+/web/dist
+/web/public/physics.wasm
+/web/src/module_bindings
+/sidecar/src/module_bindings
+*.log
+.wrangler/

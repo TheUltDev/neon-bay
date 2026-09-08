@@ -1,0 +1,12 @@
+[package]
+name = "physics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic top-down car simulation shared by the sidecar (native) and the web client (wasm)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]

@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Neon Bay · SpacetimeDB physics sidecar</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🏎️</text></svg>" />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="stage"></canvas>
+
+    <!-- The HUD is three self-packing columns over a full-bleed canvas, with the
+         hotkey bar on its own row underneath. Each column stacks its panels from
+         the top and parks one panel at the bottom, so nothing floats loose and
+         every breakpoint only has to change sizes, never the arrangement. -->
+    <div id="hud">
+      <div class="hud-cols">
+        <!-- left: where authority lives, the mixer, the link simulator -->
+        <div class="hud-col">
+          <div class="stack">
+            <section class="panel" id="authority-panel">
+              <div class="panel-title">Authority</div>
+              <div class="row"><span id="auth-dot" class="dot"></span><span id="auth-state">connecting…</span></div>
+              <div class="kv"><label>server tick</label><b id="k-servertick">—</b></div>
+              <div class="kv"><label>client tick</label><b id="k-clienttick">—</b></div>
+              <div class="kv"><label>lead</label><b id="k-lead">—</b></div>
+              <div class="kv"><label>sim</label><b id="k-simhz">60 Hz</b></div>
+            </section>
+
+            <section class="panel" id="audio-panel">
+              <div class="panel-title">Audio</div>
+              <label class="slider">master <b id="v-master">90 %</b>
+                <input type="range" id="s-master" min="0" max="100" step="1" value="90" />
+              </label>
+              <label class="slider">game effects <b id="v-sfx">85 %</b>
+                <input type="range" id="s-sfx" min="0" max="100" step="1" value="85" />
+              </label>
+              <label class="slider">music <b id="v-music">60 %</b>
+                <input type="range" id="s-music" min="0" max="100" step="1" value="60" />
+              </label>
+            </section>
+
+            <section class="panel" id="demo-panel">
+              <div class="panel-title">Link simulator</div>
+              <label class="slider">added latency <b id="v-lat">0 ms</b>
+                <input type="range" id="s-lat" min="0" max="400" step="10" value="0" />
+              </label>
+              <label class="slider">jitter <b id="v-jit">0 ms</b>
+                <input type="range" id="s-jit" min="0" max="150" step="5" value="0" />
+              </label>
+              <label class="slider">packet loss <b id="v-loss">0 %</b>
+                <input type="range" id="s-loss" min="0" max="60" step="1" value="0" />
+              </label>
+              <div class="btns">
+                <button id="b-cheat" title="Give the local car speed the physics never granted it">Desync me</button>
+                <button id="b-respawn" title="Ask the authority to reset the car (R)">Respawn</button>
+              </div>
+              <div class="toggles">
+                <label><input type="checkbox" id="t-ghost" checked /> server ghost</label>
+                <label><input type="checkbox" id="t-rotate" /> rotate camera</label>
+              </div>
+            </section>
+          </div>
+
+          <!-- bottom of the column: driver instruments -->
+          <section class="panel" id="dash-panel">
+            <canvas id="tacho" width="150" height="150"></canvas>
+            <div class="dash-side">
+              <div class="speed"><b id="k-speed">0</b><span>km/h</span></div>
+              <div class="gear">GEAR <b id="k-gear">1</b></div>
+              <div class="bars">
+                <div class="bar"><i id="bar-thr" class="thr"></i></div>
+                <div class="bar"><i id="bar-brk" class="brk"></i></div>
+                <div class="bar steerbar"><i id="bar-str" class="str"></i></div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- center: lap timing -->
+        <div class="hud-col center">
+          <section class="panel" id="lap-panel">
+            <div class="lap-line"><label>LAP</label><b id="k-lap">–</b></div>
+            <div class="lap-time" id="k-laptime">0:00.00</div>
+            <div class="lap-line small"><label>LAST</label><b id="k-lastlap">—</b><label>BEST</label><b id="k-bestlap">—</b></div>
+          </section>
+        </div>
+
+        <!-- right: the netcode story, the track, the leaderboard -->
+        <div class="hud-col">
+          <div class="stack">
+            <section class="panel" id="net-panel">
+              <div class="panel-title">Prediction &amp; reconciliation</div>
+              <canvas id="errgraph" width="252" height="62"></canvas>
+              <div class="kv"><label>round trip</label><b id="k-rtt">—</b></div>
+              <div class="kv"><label>prediction error</label><b id="k-err">0.000 m</b></div>
+              <div class="kv"><label>smoothing out</label><b id="k-smooth">0.000 m</b></div>
+              <div class="kv"><label>corrections</label><b id="k-corr">0 /s</b></div>
+              <div class="kv"><label>replayed ticks</label><b id="k-replay">0</b></div>
+              <div class="kv"><label>snapshots in</label><b id="k-snaps">— Hz</b></div>
+              <div class="kv"><label>inputs dropped</label><b id="k-dropped">0</b></div>
+              <div class="kv"><label>resyncs</label><b id="k-resync">0</b></div>
+            </section>
+
+            <canvas id="minimap" class="panel"></canvas>
+          </div>
+
+          <!-- bottom of the column: the leaderboard -->
+          <section class="panel" id="leaderboard-panel">
+            <div class="panel-title">Best laps <span>· kept by the module</span></div>
+            <ol id="leaderboard"></ol>
+          </section>
+        </div>
+      </div>
+
+      <!-- Radio strip: the keygen tune currently playing, parked directly above
+           the hotkey bar. Clicking it is the same as pressing "]". -->
+      <div id="nowplaying" title="Next station">
+        <span class="np-eq"><i></i><i></i><i></i><i></i></span>
+        <span class="np-tag">keygen radio</span>
+        <b id="np-title">—</b>
+        <span id="np-meta"></span>
+      </div>
+
+      <div class="hints">
+        <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> drive ·
+        <kbd>Space</kbd> handbrake · <kbd>R</kbd> respawn · <kbd>G</kbd> ghost · <kbd>C</kbd> camera ·
+        <kbd>M</kbd> mute · <kbd>[</kbd><kbd>]</kbd> station
+      </div>
+
+      <div id="toast"></div>
+    </div>
+
+    <!-- join / spectate overlay -->
+    <div id="gate">
+      <div class="gate-card">
+        <h1>NEON BAY</h1>
+        <p class="tagline">
+          A top-down racer whose physics runs in <b>two places at once</b>: predicted in your
+          browser, decided by an authoritative <b>sidecar</b> process. Same Rust code, compiled
+          to wasm here and native there.
+        </p>
+        <div class="gate-form">
+          <input id="g-name" maxlength="16" placeholder="driver name" autocomplete="off" />
+          <div id="g-colors"></div>
+          <button id="g-join">Join the race</button>
+        </div>
+        <div class="gate-status" id="g-status">connecting to SpacetimeDB…</div>
+        <ul class="gate-notes">
+          <li>Your browser sends <b>throttle, steering, brake, handbrake</b> — nothing else.</li>
+          <li>The sidecar owns every position. Try <b>Desync me</b> once you are driving.</li>
+          <li>Drag the latency slider to watch reconciliation earn its keep.</li>
+        </ul>
+        <!-- The long version: how the module, the sidecar and the browser split
+             the work, and what it costs. Served from public/tech.html. -->
+        <a class="gate-more" href="/tech">
+          <b>How it works <i aria-hidden="true">→</i></b>
+          <span>
+            Why the physics runs beside the database instead of inside it, how one identity
+            check keeps the server authoritative, and how the browser predicts to 0.000 m.
+          </span>
+        </a>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

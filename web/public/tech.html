@@ -1,0 +1,1396 @@
+<!doctype html>
+<html lang="en">
+<!-- The architecture explainer, served alongside the game at /tech.
+     Deliberately standalone: no imports, no build step, no framework. It lives
+     in public/ so Vite copies it verbatim into dist/, and Cloudflare's asset
+     handling resolves a request for /tech to this file. -->
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="description" content="How Neon Bay keeps SpacetimeDB authoritative while running a 60 Hz physics simulation outside the database, and how to build the same pattern for your own expensive computation." />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🏎️</text></svg>" />
+<title>Neon Bay · how it works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@300;400;500;700&display=swap">
+
+<style>
+/* Instrument-panel aesthetic, carried over from the demo's own HUD: dark
+   ground, hairline rules, uppercase eyebrows, tabular numerals. Deliberately
+   single-theme — every colour is painted explicitly so the page holds on any
+   host ground. Hue carries meaning throughout: cyan = browser, amber =
+   database, pink = sidecar. */
+:root {
+  --ground: #04060b;
+  --panel: #090d15;
+  --panel-2: #0b111c;
+  --rule: rgba(120, 170, 220, 0.16);
+  --rule-2: rgba(120, 170, 220, 0.30);
+  --text: #dbe6f5;
+  --dim: #6b7f99;
+  --dimmer: #4b5c74;
+  --cyan: #38e8ff;
+  --pink: #ff4d9d;
+  --amber: #ffc857;
+  --green: #5ef2a8;
+  --red: #ff5a6a;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+/* The host page paints its own ground behind an overscroll; paint ours. */
+html { background: var(--ground); color-scheme: dark; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  background-image:
+    radial-gradient(1100px 620px at 22% -12%, rgba(56, 232, 255, 0.10), transparent 62%),
+    radial-gradient(900px 560px at 92% 4%, rgba(255, 77, 157, 0.08), transparent 60%);
+  background-attachment: fixed;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.68;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ------------------------------------------------------------- structure -- */
+
+.shell {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 0 22px 88px;
+}
+
+.masthead {
+  padding: 54px 0 26px;
+  border-bottom: 1px solid var(--rule);
+}
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--dim);
+}
+.masthead h1 {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: clamp(30px, 5.4vw, 50px);
+  letter-spacing: 0.14em;
+  line-height: 1.06;
+  margin: 14px 0 0;
+  background: linear-gradient(92deg, var(--cyan), var(--pink));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  text-wrap: balance;
+}
+.masthead .lede {
+  max-width: 60ch;
+  margin: 18px 0 0;
+  font-size: 17px;
+  color: #b9c8dd;
+}
+.masthead .lede b { color: var(--text); font-weight: 600; }
+.masthead .meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dimmer);
+  margin-top: 20px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+}
+.masthead .meta a { color: var(--cyan); }
+
+/* The readout strip: the demo's own measured figures, in the demo's own idiom. */
+.readout {
+  display: grid;
+  /* Six figures, so only column counts that divide six — a lone tile in the
+     last row reads as a layout accident rather than a set. */
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1px;
+  margin: 26px 0 0;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.readout div {
+  background: var(--panel);
+  padding: 12px 14px;
+}
+.readout dt {
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--dim);
+  margin: 0 0 5px;
+}
+.readout dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 19px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.readout dd small { font-size: 11px; color: var(--dim); font-weight: 400; letter-spacing: 0; }
+.readout .v-green dd { color: var(--green); }
+.readout .v-cyan dd { color: var(--cyan); }
+.readout .v-pink dd { color: var(--pink); }
+.readout .v-amber dd { color: var(--amber); }
+.readout-note {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--dimmer);
+  margin: 9px 0 0;
+}
+@media (min-width: 620px) { .readout { grid-template-columns: repeat(3, 1fr); } }
+@media (min-width: 1000px) { .readout { grid-template-columns: repeat(6, 1fr); } }
+
+.body-grid { display: block; }
+
+.toc { display: none; }
+
+@media (min-width: 1080px) {
+  .body-grid {
+    display: grid;
+    grid-template-columns: 178px minmax(0, 1fr);
+    gap: 46px;
+    align-items: start;
+  }
+  .toc {
+    display: block;
+    position: sticky;
+    top: 26px;
+    padding-top: 44px;
+  }
+}
+.toc ol { list-style: none; margin: 0; padding: 0; display: grid; gap: 3px; }
+.toc a {
+  display: block;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--dim);
+  text-decoration: none;
+  padding: 4px 0 4px 10px;
+  border-left: 1px solid var(--rule);
+}
+.toc a:hover, .toc a:focus-visible { color: var(--text); border-left-color: var(--cyan); }
+
+/* ---------------------------------------------------------------- panels -- */
+
+section { padding-top: 44px; scroll-margin-top: 20px; }
+/* Prose is measure-limited; the kicker rule spans the whole column so it lines
+   up with the figures and tables below it. */
+section > .prose, section > h2 { max-width: 68ch; }
+
+.kicker {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--dim);
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: 16px;
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  max-width: none;
+}
+.kicker .lane { font-weight: 400; letter-spacing: 0.1em; }
+.lane-browser { color: var(--cyan); }
+.lane-db { color: var(--amber); }
+.lane-sidecar { color: var(--pink); }
+
+h2 {
+  font-family: var(--mono);
+  font-size: clamp(20px, 2.6vw, 26px);
+  font-weight: 500;
+  letter-spacing: -0.005em;
+  line-height: 1.24;
+  margin: 0 0 14px;
+  text-wrap: balance;
+}
+h3 {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  margin: 30px 0 8px;
+}
+p { margin: 0 0 15px; }
+.prose > :last-child { margin-bottom: 0; }
+strong { font-weight: 600; color: #fff; }
+em { font-style: italic; color: #c3d3e8; }
+
+code {
+  font-family: var(--mono);
+  font-size: 0.875em;
+  color: var(--cyan);
+  background: rgba(56, 232, 255, 0.07);
+  border: 1px solid rgba(56, 232, 255, 0.14);
+  border-radius: 4px;
+  padding: 0.5px 4px;
+  white-space: nowrap;
+}
+a { color: var(--cyan); text-decoration-color: rgba(56, 232, 255, 0.4); text-underline-offset: 2px; }
+a:focus-visible, button:focus-visible, input:focus-visible {
+  outline: 2px solid var(--cyan);
+  outline-offset: 2px;
+}
+
+ul.notes { margin: 0 0 15px; padding: 0; list-style: none; display: grid; gap: 10px; }
+ul.notes li { padding-left: 18px; position: relative; }
+ul.notes li::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0.62em;
+  width: 6px; height: 1px;
+  background: var(--rule-2);
+}
+
+ol.steps { margin: 0; padding: 0; list-style: none; counter-reset: step; display: grid; gap: 14px; }
+ol.steps li { counter-increment: step; padding-left: 38px; position: relative; }
+ol.steps li::before {
+  content: counter(step, decimal-leading-zero);
+  position: absolute; left: 0; top: 0.1em;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--cyan);
+  border: 1px solid rgba(56, 232, 255, 0.28);
+  border-radius: 4px;
+  padding: 2px 5px;
+  line-height: 1;
+}
+ol.steps b { display: block; font-family: var(--mono); font-weight: 500; font-size: 13.5px; color: #fff; margin-bottom: 2px; }
+
+/* ------------------------------------------------------------ set-pieces -- */
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  padding: 18px 20px;
+  margin: 22px 0;
+}
+.card-title {
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--dim);
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: 13px;
+}
+.card p:last-child, .card ul:last-child { margin-bottom: 0; }
+
+.pull {
+  border-left: 2px solid var(--pink);
+  padding: 2px 0 2px 18px;
+  margin: 24px 0;
+  font-family: var(--mono);
+  font-size: 15px;
+  line-height: 1.6;
+  color: #eaf1fb;
+  max-width: 62ch;
+}
+
+figure { margin: 26px 0; }
+.scroller { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--rule-2) transparent; }
+.scroller::-webkit-scrollbar { height: 6px; }
+.scroller::-webkit-scrollbar-thumb { background: var(--rule-2); border-radius: 3px; }
+figure svg {
+  display: block;
+  width: 100%;
+  min-width: 660px;
+  height: auto;
+  color: var(--dim);
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+}
+figcaption {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--dim);
+  margin-top: 10px;
+  max-width: 72ch;
+}
+figcaption b { color: #adbdd2; font-weight: 500; }
+
+.svg-box { fill: var(--panel-2); stroke: var(--rule-2); stroke-width: 1; }
+.svg-inner { fill: rgba(255, 200, 87, 0.06); stroke: rgba(255, 200, 87, 0.34); stroke-width: 1; }
+.svg-t { font-family: var(--mono); font-size: 11px; fill: var(--text); }
+.svg-s { font-family: var(--mono); font-size: 10px; fill: var(--dim); }
+.svg-h { font-family: var(--mono); font-size: 11px; font-weight: 500; letter-spacing: 0.14em; }
+/* Colour is set per element so a presentation attribute is never overridden. */
+.svg-line { stroke-width: 1.2; fill: none; }
+
+/* code */
+.code {
+  margin: 22px 0;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--panel);
+}
+.code header {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: baseline;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--rule);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+  background: rgba(255, 255, 255, 0.014);
+}
+.code header em { font-style: normal; color: var(--dimmer); letter-spacing: 0.04em; }
+.code pre {
+  margin: 0;
+  padding: 14px 16px 16px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.72;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-2) transparent;
+}
+.code pre::-webkit-scrollbar { height: 6px; }
+.code pre::-webkit-scrollbar-thumb { background: var(--rule-2); border-radius: 3px; }
+.c { color: var(--dimmer); font-style: italic; }
+.k { color: #7f9dc4; }
+.fn-db { color: var(--amber); }
+.fn-side { color: var(--pink); }
+.fn-web { color: var(--cyan); }
+.n { color: var(--green); }
+.st { color: var(--green); }
+
+/* tables */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  min-width: 560px;
+}
+caption {
+  caption-side: top;
+  text-align: left;
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--dim);
+  padding-bottom: 9px;
+}
+th, td {
+  text-align: left;
+  padding: 9px 14px 9px 0;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+}
+thead th {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  color: var(--dim);
+  border-bottom-color: var(--rule-2);
+}
+tbody th { font-family: var(--mono); font-size: 12.5px; font-weight: 400; color: var(--text); white-space: nowrap; }
+td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+tr:last-child th, tr:last-child td { border-bottom: none; }
+/* Subtotal rows: a heavier rule above, and the lane colour of whichever side of
+   the wire the figure belongs to. */
+tr.sum th, tr.sum td { border-top: 1px solid var(--rule-2); color: #fff; }
+tr.sum td.num { font-weight: 500; }
+tr.sum.srv th, tr.sum.srv td.num { color: var(--pink); }
+tr.sum.cli th, tr.sum.cli td.num { color: var(--cyan); }
+.tbl { margin: 22px 0; }
+
+.tag {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border-radius: 3px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+.tag.ok { color: var(--green); background: rgba(94, 242, 168, 0.10); border: 1px solid rgba(94, 242, 168, 0.3); }
+.tag.no { color: var(--red); background: rgba(255, 90, 106, 0.10); border: 1px solid rgba(255, 90, 106, 0.3); }
+.tag.mid { color: var(--amber); background: rgba(255, 200, 87, 0.10); border: 1px solid rgba(255, 200, 87, 0.3); }
+
+/* the lead calculator, in the demo's own control idiom */
+.rig {
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  padding: 16px 18px 18px;
+  margin: 24px 0;
+  max-width: 560px;
+}
+.rig .card-title { margin-bottom: 14px; }
+.rig label {
+  display: block;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  letter-spacing: 0.04em;
+}
+.rig label b { float: right; color: var(--text); font-variant-numeric: tabular-nums; }
+.rig input[type=range] {
+  width: 100%;
+  margin: 8px 0 16px;
+  accent-color: var(--cyan);
+  height: 3px;
+  cursor: pointer;
+}
+.rig-out {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 12px;
+  border-top: 1px solid var(--rule);
+  padding-top: 13px;
+}
+.rig-out div span {
+  display: block;
+  font-family: var(--mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  color: var(--dim);
+  margin-bottom: 4px;
+}
+.rig-out div b {
+  font-family: var(--mono);
+  font-size: 17px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.rig-out .o-rtt b { color: var(--amber); }
+.rig-out .o-lead b { color: var(--pink); }
+.rig-out .o-lag b { color: var(--green); }
+.rig-foot { font-family: var(--mono); font-size: 10px; color: var(--dimmer); margin: 12px 0 0; line-height: 1.6; }
+
+footer {
+  margin-top: 62px;
+  padding-top: 22px;
+  border-top: 1px solid var(--rule);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dimmer);
+  line-height: 1.9;
+}
+footer a { color: var(--dim); }
+kbd {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  border: 1px solid var(--rule);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  color: var(--dim);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation: none !important; transition: none !important; }
+}
+</style>
+
+</head>
+
+<body>
+<div class="shell">
+
+  <header class="masthead">
+    <p class="eyebrow">SpacetimeDB · proof of concept</p>
+    <h1>THE PHYSICS SIDECAR</h1>
+    <p class="lede">
+      A 60&nbsp;Hz car simulation with <b>full server authority</b> and none of the physics
+      inside the database. The module keeps an inbox, a registry and an outbox; a trusted
+      external process does the arithmetic. Here is the mechanism, and how to build one
+      for whatever expensive thing you have.
+    </p>
+    <p class="meta">
+      <span>Rust · SpacetimeDB 2.8 · wasm32-unknown-unknown</span>
+      <span><a href="/">&larr; back to the race</a></span>
+    </p>
+
+    <dl class="readout">
+      <div class="v-pink"><dt>authority sim</dt><dd>60.0 <small>Hz</small></dd></div>
+      <div class="v-amber"><dt>snapshots out</dt><dd>20.0 <small>Hz</small></dd></div>
+      <div class="v-cyan"><dt>cost per tick</dt><dd>6.1 <small>µs</small></dd></div>
+      <div><dt>tick budget used</dt><dd>0.0 <small>%</small></dd></div>
+      <div class="v-green"><dt>prediction error</dt><dd>0.000 <small>m</small></dd></div>
+      <div><dt>browser core</dt><dd>38 <small>KB wasm</small></dd></div>
+    </dl>
+    <p class="readout-note">Measured on the sidecar's own status line: 7 cars, 6 of them AI drivers. The zero holds across a ~90 ms round trip to Railway too.</p>
+  </header>
+
+  <div class="body-grid">
+
+    <nav class="toc" aria-label="Sections">
+      <ol>
+        <li><a href="#cost">The cost of a tick</a></li>
+        <li><a href="#shape">Inbox, registry, outbox</a></li>
+        <li><a href="#trust">The trust gate</a></li>
+        <li><a href="#loop">Anatomy of a tick</a></li>
+        <li><a href="#schedule">Scheduling inputs</a></li>
+        <li><a href="#client">The client half</a></li>
+        <li><a href="#determinism">Determinism</a></li>
+        <li><a href="#restart">Restarts</a></li>
+        <li><a href="#size">The size of it</a></li>
+        <li><a href="#build">Build your own</a></li>
+        <li><a href="#gaps">Honest gaps</a></li>
+      </ol>
+    </nav>
+
+    <main>
+
+      <!-- ============================================================ 1 -->
+      <section id="cost">
+        <div class="kicker"><span>The cost of a tick</span><span class="lane lane-db">module</span></div>
+        <div class="prose">
+          <h2>A reducer is a transaction. Sixty a second, per entity, adds up.</h2>
+          <p>
+            Running the simulation inside the module works, and SpacetimeDB is well able to
+            host it. The question is what it costs. Every tick is a transaction, and at 60&nbsp;Hz
+            per car that is throughput spent integrating tire forces, resolving collisions and
+            running bot AI rather than on everything else the database is doing for you.
+          </p>
+          <p>
+            The usual escape hatch is to let clients own their positions, which buys back the
+            frame rate by giving away the security model. There is a third option, and it is the
+            only one that keeps both: move the computation out, keep the authority in.
+          </p>
+        </div>
+
+        <figure>
+          <div class="scroller">
+            <svg viewBox="0 0 960 316" role="img" aria-label="Three placements for a 60 Hz simulation: inside the module, in a sidecar process, or on the client. The compute moves down the stack; only the client-side option gives up server authority.">
+              <defs>
+                <marker id="m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                  <path d="M0 0 L10 5 L0 10 z" fill="#6b7f99"/>
+                </marker>
+                <marker id="m1r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                  <path d="M0 0 L10 5 L0 10 z" fill="#ff5a6a"/>
+                </marker>
+              </defs>
+
+              <!-- option 1 -->
+              <text class="svg-h" x="160" y="22" text-anchor="middle" fill="#6b7f99">IN THE MODULE</text>
+              <rect class="svg-box" x="30" y="40" width="260" height="46" rx="7"/>
+              <text class="svg-t" x="46" y="68" fill="#38e8ff">browser</text>
+              <rect class="svg-box" x="30" y="126" width="260" height="46" rx="7"/>
+              <text class="svg-t" x="46" y="154" fill="#ffc857">spacetimedb</text>
+              <rect x="176" y="136" width="98" height="26" rx="5" fill="rgba(255,200,87,0.14)" stroke="#ffc857" stroke-width="1"/>
+              <text class="svg-s" x="225" y="153" text-anchor="middle" fill="#ffc857">60 Hz sim</text>
+              <rect x="30" y="212" width="260" height="46" rx="7" fill="none" stroke="rgba(120,170,220,0.16)" stroke-width="1" stroke-dasharray="3 4"/>
+              <text class="svg-s" x="160" y="240" text-anchor="middle" fill="#4b5c74">no extra process</text>
+              <line class="svg-line" x1="120" y1="88" x2="120" y2="122" stroke="#6b7f99" marker-end="url(#m1)"/>
+              <line class="svg-line" x1="200" y1="124" x2="200" y2="90" stroke="#6b7f99" marker-end="url(#m1)"/>
+              <text class="svg-s" x="112" y="110" text-anchor="end">inputs</text>
+              <text class="svg-s" x="208" y="110">state</text>
+              <text class="svg-s" x="160" y="284" text-anchor="middle" fill="#5ef2a8">server authoritative</text>
+              <text class="svg-s" x="160" y="302" text-anchor="middle" fill="#4b5c74">every tick is a transaction</text>
+
+              <!-- option 2 -->
+              <text class="svg-h" x="480" y="22" text-anchor="middle" fill="#6b7f99">IN A SIDECAR</text>
+              <rect class="svg-box" x="350" y="40" width="260" height="46" rx="7"/>
+              <text class="svg-t" x="366" y="68" fill="#38e8ff">browser</text>
+              <rect class="svg-box" x="350" y="126" width="260" height="46" rx="7"/>
+              <text class="svg-t" x="366" y="154" fill="#ffc857">spacetimedb</text>
+              <rect class="svg-box" x="350" y="212" width="260" height="46" rx="7"/>
+              <text class="svg-t" x="366" y="240" fill="#ff4d9d">sidecar</text>
+              <rect x="496" y="222" width="98" height="26" rx="5" fill="rgba(255,200,87,0.14)" stroke="#ffc857" stroke-width="1"/>
+              <text class="svg-s" x="545" y="239" text-anchor="middle" fill="#ffc857">60 Hz sim</text>
+              <line class="svg-line" x1="440" y1="88" x2="440" y2="122" stroke="#6b7f99" marker-end="url(#m1)"/>
+              <line class="svg-line" x1="520" y1="124" x2="520" y2="90" stroke="#6b7f99" marker-end="url(#m1)"/>
+              <text class="svg-s" x="432" y="110" text-anchor="end">inputs</text>
+              <text class="svg-s" x="528" y="110">state</text>
+              <line class="svg-line" x1="440" y1="174" x2="440" y2="208" stroke="#6b7f99" marker-end="url(#m1)"/>
+              <line class="svg-line" x1="520" y1="210" x2="520" y2="176" stroke="#6b7f99" marker-end="url(#m1)"/>
+              <text class="svg-s" x="432" y="196" text-anchor="end">subscribe</text>
+              <text class="svg-s" x="528" y="196">push</text>
+              <text class="svg-s" x="480" y="284" text-anchor="middle" fill="#5ef2a8">server authoritative</text>
+              <text class="svg-s" x="480" y="302" text-anchor="middle" fill="#4b5c74">one more process to run</text>
+
+              <!-- option 3 -->
+              <text class="svg-h" x="800" y="22" text-anchor="middle" fill="#6b7f99">ON THE CLIENT</text>
+              <rect x="670" y="40" width="260" height="46" rx="7" fill="#0b111c" stroke="rgba(255,90,106,0.45)" stroke-width="1"/>
+              <text class="svg-t" x="686" y="68" fill="#38e8ff">browser</text>
+              <rect x="816" y="50" width="98" height="26" rx="5" fill="rgba(255,200,87,0.14)" stroke="#ffc857" stroke-width="1"/>
+              <text class="svg-s" x="865" y="67" text-anchor="middle" fill="#ffc857">60 Hz sim</text>
+              <rect class="svg-box" x="670" y="126" width="260" height="46" rx="7"/>
+              <text class="svg-t" x="686" y="154" fill="#ffc857">spacetimedb</text>
+              <rect x="670" y="212" width="260" height="46" rx="7" fill="none" stroke="rgba(120,170,220,0.16)" stroke-width="1" stroke-dasharray="3 4"/>
+              <text class="svg-s" x="800" y="240" text-anchor="middle" fill="#4b5c74">no extra process</text>
+              <line class="svg-line" x1="760" y1="88" x2="760" y2="122" stroke="#ff5a6a" marker-end="url(#m1r)"/>
+              <line class="svg-line" x1="840" y1="124" x2="840" y2="90" stroke="#6b7f99" marker-end="url(#m1)"/>
+              <text class="svg-s" x="752" y="110" text-anchor="end" fill="#ff5a6a">positions</text>
+              <text class="svg-s" x="848" y="110">state</text>
+              <text class="svg-s" x="800" y="284" text-anchor="middle" fill="#ff5a6a">client authoritative</text>
+              <text class="svg-s" x="800" y="302" text-anchor="middle" fill="#4b5c74">a car is wherever it says it is</text>
+            </svg>
+          </div>
+          <figcaption>
+            <b>The compute moves; the trust boundary is what you are actually choosing.</b>
+            Follow the amber pill. Options one and two both leave the client saying nothing but
+            &ldquo;throttle down&rdquo;; only the third lets it assert a position, which is what makes it cheap
+            and what makes it forgeable.
+          </figcaption>
+        </figure>
+
+        <div class="prose">
+          <p>
+            Neon Bay takes the middle column. The physics lives in a <strong>sidecar</strong>: an ordinary
+            SpacetimeDB client that happens to be trusted, running the simulation in its own process
+            at a fixed 60&nbsp;Hz and writing the results back through a reducer only it is allowed to call.
+          </p>
+        </div>
+
+        <p class="pull">
+          The database still holds the one true answer.<br>It just stopped being the thing that computes it.
+        </p>
+      </section>
+
+      <!-- ============================================================ 2 -->
+      <section id="shape">
+        <div class="kicker"><span>Inbox, registry, outbox</span><span class="lane lane-db">module</span></div>
+        <div class="prose">
+          <h2>The module becomes a mailbox with a schema.</h2>
+          <p>
+            Strip the simulation out and what is left is small enough to describe in three words.
+            The module in this demo is 583 lines of Rust and contains no integrator, no collision
+            code and not even a track. It is:
+          </p>
+          <ul class="notes">
+            <li><strong>An inbox.</strong> <code>input</code> — one row per client, overwritten ~30 times a second, holding throttle, steering, brake, handbrake. The only thing a player is trusted to assert.</li>
+            <li><strong>A registry.</strong> <code>config</code>, <code>player</code>, <code>car</code> — who is connected, which physics slot is theirs, and which identity is allowed to be the authority.</li>
+            <li><strong>An outbox.</strong> <code>car_state</code> — one authoritative pose per car, written only by the sidecar, fanned out to every subscriber by the database.</li>
+          </ul>
+          <p>
+            A fourth table, <code>lap_record</code>, keeps best laps. That is deliberate: aggregating
+            results is bookkeeping, not simulation, so it belongs in the database. The line to hold is
+            not &ldquo;nothing runs in the module&rdquo; — it is <em>nothing that runs every tick</em>.
+          </p>
+        </div>
+
+        <figure>
+          <div class="scroller">
+            <svg viewBox="0 0 1000 372" role="img" aria-label="Data flow: the browser writes inputs into the module's input table at 30 Hz, the sidecar subscribes to them, simulates at 60 Hz, and pushes authoritative state back through push_states at 20 Hz, which the browser subscribes to.">
+              <defs>
+                <marker id="m2d" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                  <path d="M0 0 L10 5 L0 10 z" fill="#6b7f99"/>
+                </marker>
+                <marker id="m2c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                  <path d="M0 0 L10 5 L0 10 z" fill="#38e8ff"/>
+                </marker>
+                <marker id="m2p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                  <path d="M0 0 L10 5 L0 10 z" fill="#ff4d9d"/>
+                </marker>
+                <marker id="m2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                  <path d="M0 0 L10 5 L0 10 z" fill="#ffc857"/>
+                </marker>
+              </defs>
+
+              <text class="svg-h" x="140" y="24" text-anchor="middle" fill="#38e8ff">BROWSER</text>
+              <text class="svg-s" x="140" y="40" text-anchor="middle">untrusted</text>
+              <text class="svg-h" x="500" y="24" text-anchor="middle" fill="#ffc857">SPACETIMEDB</text>
+              <text class="svg-s" x="500" y="40" text-anchor="middle">the module</text>
+              <text class="svg-h" x="860" y="24" text-anchor="middle" fill="#ff4d9d">SIDECAR</text>
+              <text class="svg-s" x="860" y="40" text-anchor="middle">a trusted client</text>
+
+              <rect class="svg-box" x="24" y="56" width="232" height="248" rx="10"/>
+              <rect class="svg-box" x="372" y="56" width="256" height="248" rx="10"/>
+              <rect class="svg-box" x="744" y="56" width="232" height="248" rx="10"/>
+
+              <!-- browser contents -->
+              <text class="svg-t" x="44" y="92" fill="#38e8ff">physics.wasm</text>
+              <text class="svg-s" x="44" y="110">cdylib · 38 KB · 0 imports</text>
+              <line x1="44" y1="128" x2="236" y2="128" stroke="rgba(120,170,220,0.16)" stroke-width="1"/>
+              <text class="svg-s" x="44" y="152" fill="#dbe6f5">predict every tick</text>
+              <text class="svg-s" x="44" y="172" fill="#dbe6f5">rewind + replay on error</text>
+              <text class="svg-s" x="44" y="192" fill="#dbe6f5">interpolate everyone else</text>
+
+              <!-- module contents -->
+              <rect class="svg-inner" x="390" y="76" width="220" height="44" rx="6"/>
+              <text class="svg-t" x="404" y="95" fill="#ffc857">input</text>
+              <text class="svg-s" x="404" y="111">inbox · one row per client</text>
+              <rect class="svg-inner" x="390" y="142" width="220" height="44" rx="6"/>
+              <text class="svg-t" x="404" y="161" fill="#ffc857">config · player · car</text>
+              <text class="svg-s" x="404" y="177">registry · who, and who may write</text>
+              <rect class="svg-inner" x="390" y="214" width="220" height="44" rx="6"/>
+              <text class="svg-t" x="404" y="233" fill="#ffc857">car_state</text>
+              <text class="svg-s" x="404" y="249">outbox · authoritative pose</text>
+              <text class="svg-s" x="500" y="286" text-anchor="middle" fill="#4b5c74">no integrator · no collisions · no track</text>
+
+              <!-- sidecar contents -->
+              <text class="svg-t" x="764" y="92" fill="#ff4d9d">physics (rlib)</text>
+              <text class="svg-s" x="764" y="110">same source, built native</text>
+              <line x1="764" y1="128" x2="956" y2="128" stroke="rgba(120,170,220,0.16)" stroke-width="1"/>
+              <text class="svg-s" x="764" y="152" fill="#dbe6f5">60 Hz fixed step</text>
+              <text class="svg-s" x="764" y="172" fill="#dbe6f5">bot AI · collisions</text>
+              <text class="svg-s" x="764" y="192" fill="#dbe6f5">6.1 µs per tick</text>
+
+              <!-- top lane: inputs travelling right -->
+              <line class="svg-line" x1="258" y1="98" x2="368" y2="98" stroke="#38e8ff" marker-end="url(#m2c)"/>
+              <text class="svg-s" x="313" y="88" text-anchor="middle" fill="#38e8ff">set_input</text>
+              <text class="svg-s" x="313" y="116" text-anchor="middle">30 Hz</text>
+              <line class="svg-line" x1="630" y1="98" x2="740" y2="98" stroke="#6b7f99" marker-end="url(#m2d)"/>
+              <text class="svg-s" x="685" y="88" text-anchor="middle">subscribe</text>
+              <text class="svg-s" x="685" y="116" text-anchor="middle">as it lands</text>
+
+              <!-- bottom lane: state travelling left -->
+              <line class="svg-line" x1="740" y1="236" x2="632" y2="236" stroke="#ff4d9d" marker-end="url(#m2p)"/>
+              <text class="svg-s" x="686" y="226" text-anchor="middle" fill="#ff4d9d">push_states</text>
+              <line x1="654" y1="220" x2="654" y2="252" stroke="#ff4d9d" stroke-width="3"/>
+              <text class="svg-s" x="686" y="264" text-anchor="middle" fill="#ff4d9d">gated on</text>
+              <text class="svg-s" x="686" y="278" text-anchor="middle" fill="#ff4d9d">config.sidecar</text>
+              <line class="svg-line" x1="368" y1="236" x2="260" y2="236" stroke="#ffc857" marker-end="url(#m2a)"/>
+              <text class="svg-s" x="314" y="226" text-anchor="middle" fill="#ffc857">car_state</text>
+              <text class="svg-s" x="314" y="252" text-anchor="middle">20 Hz, fanned out</text>
+
+              <text class="svg-s" x="24" y="336" fill="#4b5c74">inputs travel right along the top lane · authoritative state travels left along the bottom · the module never computes either</text>
+            </svg>
+          </div>
+          <figcaption>
+            <b>Two lanes, one loop.</b> Nothing in the picture is bespoke transport: the sidecar is
+            using the same subscription machinery as the browser, on the same public tables. What makes
+            it the authority is one identity check on one reducer.
+          </figcaption>
+        </figure>
+      </section>
+
+      <!-- ============================================================ 3 -->
+      <section id="trust">
+        <div class="kicker"><span>The trust gate</span><span class="lane lane-db">module</span></div>
+        <div class="prose">
+          <h2>Eight lines are the whole security model.</h2>
+          <p>
+            The sidecar is not privileged by the runtime. It authenticates like any other client and
+            gets an ordinary <code>Identity</code>. What makes it the authority is that the module
+            wrote that identity down and checks it.
+          </p>
+        </div>
+
+        <div class="code">
+          <header><span>module/src/lib.rs</span><em>the entire trust boundary</em></header>
+<pre><span class="c">/// Claim the right to publish authoritative state. First caller wins; a second
+/// sidecar can only take over once the first has disconnected.</span>
+<span class="k">#[reducer]</span>
+<span class="k">pub fn</span> <span class="fn-db">claim_authority</span>(ctx: &amp;ReducerContext) -&gt; Result&lt;(), String&gt; {
+    <span class="k">let mut</span> cfg = config(ctx);
+    <span class="k">match</span> cfg.sidecar {
+        Some(existing) <span class="k">if</span> existing != ctx.sender() &amp;&amp; cfg.sidecar_online =&gt; {
+            <span class="k">return</span> Err(<span class="st">"another sidecar already holds authority"</span>.into());
+        }
+        _ =&gt; {}
+    }
+    cfg.sidecar = Some(ctx.sender());
+    cfg.sidecar_online = <span class="k">true</span>;
+    ctx.db.config().id().update(cfg);
+    Ok(())
+}
+
+<span class="k">fn</span> <span class="fn-db">require_authority</span>(ctx: &amp;ReducerContext) -&gt; Result&lt;Config, String&gt; {
+    <span class="k">let</span> cfg = config(ctx);
+    <span class="k">if</span> cfg.sidecar == Some(ctx.sender()) {
+        Ok(cfg)
+    } <span class="k">else</span> {
+        Err(<span class="st">"only the registered sidecar may write simulation state"</span>.into())
+    }
+}</pre>
+        </div>
+
+        <div class="prose">
+          <p>
+            Every reducer that writes simulation state — <code>push_states</code>, <code>spawn_bot</code>,
+            <code>despawn_bot</code> — opens with <code>require_authority(ctx)?</code>. Every reducer a
+            player can reach does not, because none of them touch a position. The complete client-facing
+            hot path is one reducer:
+          </p>
+        </div>
+
+        <div class="tbl scroller">
+          <table>
+            <caption>What each side is allowed to say</caption>
+            <thead>
+              <tr><th scope="col">Reducer</th><th scope="col">Caller</th><th scope="col">Rate</th><th scope="col">Carries</th></tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row">set_input</th><td><span class="tag ok">any player</span></td><td class="num">30 Hz</td><td>throttle, steer, brake, handbrake, and the tick they belong to</td></tr>
+              <tr><th scope="row">request_respawn</th><td><span class="tag ok">any player</span></td><td class="num">on demand</td><td>a counter bump; the sidecar decides what respawning means</td></tr>
+              <tr><th scope="row">join_race / leave_race</th><td><span class="tag ok">any player</span></td><td class="num">once</td><td>a name and a colour</td></tr>
+              <tr><th scope="row">push_states</th><td><span class="tag no">sidecar only</span></td><td class="num">20 Hz</td><td>every car's full pose, in one transaction</td></tr>
+              <tr><th scope="row">spawn_bot / despawn_bot</th><td><span class="tag no">sidecar only</span></td><td class="num">on demand</td><td>AI drivers the authority owns outright</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="prose">
+          <p>
+            There is no reducer anywhere that lets a player assert a position, a lap or a time. So the
+            trust boundary did not disappear — it <em>moved</em>, from &ldquo;the database is the only thing
+            that can be trusted&rdquo; to &ldquo;the database plus one identity you control.&rdquo;
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Be clear-eyed about the claim</div>
+          <p>
+            <code>claim_authority</code> is first-come. While the sidecar is connected nobody can take
+            it, but during the restart window after a deploy, whoever connects first wins. On a demo
+            that is a curiosity. On anything real, sign the sidecar's identity into the module at
+            publish time rather than letting it be claimed at runtime.
+          </p>
+        </div>
+      </section>
+
+      <!-- ============================================================ 4 -->
+      <section id="loop">
+        <div class="kicker"><span>Anatomy of a tick</span><span class="lane lane-sidecar">sidecar</span></div>
+        <div class="prose">
+          <h2>Connect, claim, then never stop.</h2>
+          <p>
+            Startup is four steps: connect with a cached token, subscribe to the five tables the
+            simulation touches, call <code>claim_authority</code>, and resume the tick counter from
+            <code>config.server_tick</code>. Then it is a loop that does the same six things forever.
+          </p>
+        </div>
+
+        <div class="code">
+          <header><span>sidecar/src/authority.rs</span><em>one simulation tick</em></header>
+<pre><span class="k">pub fn</span> <span class="fn-side">step</span>(&amp;<span class="k">mut self</span>, conn: &amp;DbConnection) {
+    <span class="k">self</span>.check_authority(conn);   <span class="c">// still ours? re-claim at most 1/s</span>
+    <span class="k">self</span>.sync_cars(conn);         <span class="c">// reconcile slots against the `car` table</span>
+    <span class="k">self</span>.pull_inputs(conn);       <span class="c">// promote whatever is due this tick</span>
+    <span class="k">self</span>.drive_bots();            <span class="c">// the AI that would otherwise cost transactions</span>
+
+    <span class="k">self</span>.world.step(<span class="k">self</span>.world.active);
+
+    <span class="k">if self</span>.has_authority &amp;&amp; <span class="k">self</span>.world.tick % SNAPSHOT_EVERY == <span class="n">0</span> {
+        <span class="k">self</span>.publish(conn);       <span class="c">// every 3rd tick: 60 Hz / 3 = 20 Hz</span>
+    }
+}</pre>
+        </div>
+
+        <figure>
+          <div class="scroller">
+            <svg viewBox="0 0 1000 262" role="img" aria-label="The sidecar simulates every tick at 60 Hz and publishes a snapshot on every third tick, giving 20 Hz on the wire. Each tick runs six stages: check authority, sync cars, pull inputs, drive bots, world step, and conditionally publish.">
+              <defs>
+                <marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                  <path d="M0 0 L10 5 L0 10 z" fill="#6b7f99"/>
+                </marker>
+              </defs>
+
+              <text class="svg-h" x="42" y="26" fill="#6b7f99">60 Hz SIMULATION</text>
+              <text class="svg-h" x="958" y="26" text-anchor="end" fill="#ff4d9d">20 Hz PUBLISH</text>
+
+              <line x1="42" y1="66" x2="958" y2="66" stroke="rgba(120,170,220,0.30)" stroke-width="1"/>
+              <g stroke="#6b7f99" stroke-width="1">
+                <line x1="60" y1="58" x2="60" y2="74"/><line x1="130" y1="60" x2="130" y2="72"/><line x1="200" y1="60" x2="200" y2="72"/>
+                <line x1="270" y1="58" x2="270" y2="74"/><line x1="340" y1="60" x2="340" y2="72"/><line x1="410" y1="60" x2="410" y2="72"/>
+                <line x1="480" y1="58" x2="480" y2="74"/><line x1="550" y1="60" x2="550" y2="72"/><line x1="620" y1="60" x2="620" y2="72"/>
+                <line x1="690" y1="58" x2="690" y2="74"/><line x1="760" y1="60" x2="760" y2="72"/><line x1="830" y1="60" x2="830" y2="72"/>
+                <line x1="900" y1="58" x2="900" y2="74"/>
+              </g>
+              <g fill="#ff4d9d">
+                <polygon points="60,42 66,54 54,54"/><polygon points="270,42 276,54 264,54"/>
+                <polygon points="480,42 486,54 474,54"/><polygon points="690,42 696,54 684,54"/>
+                <polygon points="900,42 906,54 894,54"/>
+              </g>
+              <text class="svg-s" x="60" y="90" text-anchor="middle">t</text>
+              <text class="svg-s" x="270" y="90" text-anchor="middle">t+3</text>
+              <text class="svg-s" x="480" y="90" text-anchor="middle">t+6</text>
+              <text class="svg-s" x="690" y="90" text-anchor="middle">t+9</text>
+              <text class="svg-s" x="900" y="90" text-anchor="middle">t+12</text>
+
+              <path d="M340 78 L340 96 L42 112" fill="none" stroke="rgba(120,170,220,0.30)" stroke-width="1" stroke-dasharray="3 4"/>
+              <path d="M410 78 L410 96 L958 112" fill="none" stroke="rgba(120,170,220,0.30)" stroke-width="1" stroke-dasharray="3 4"/>
+              <text class="svg-s" x="375" y="106" text-anchor="middle" fill="#4b5c74">one tick</text>
+
+              <g>
+                <rect class="svg-box" x="42" y="126" width="136" height="44" rx="6"/>
+                <text class="svg-s" x="110" y="153" text-anchor="middle" fill="#dbe6f5">check_authority</text>
+                <rect class="svg-box" x="198" y="126" width="136" height="44" rx="6"/>
+                <text class="svg-s" x="266" y="153" text-anchor="middle" fill="#dbe6f5">sync_cars</text>
+                <rect class="svg-box" x="354" y="126" width="136" height="44" rx="6"/>
+                <text class="svg-s" x="422" y="153" text-anchor="middle" fill="#dbe6f5">pull_inputs</text>
+                <rect class="svg-box" x="510" y="126" width="136" height="44" rx="6"/>
+                <text class="svg-s" x="578" y="153" text-anchor="middle" fill="#dbe6f5">drive_bots</text>
+                <rect x="666" y="126" width="136" height="44" rx="6" fill="rgba(255,200,87,0.10)" stroke="rgba(255,200,87,0.4)" stroke-width="1"/>
+                <text class="svg-s" x="734" y="153" text-anchor="middle" fill="#ffc857">world.step</text>
+                <rect x="822" y="126" width="136" height="44" rx="6" fill="rgba(255,77,157,0.10)" stroke="rgba(255,77,157,0.45)" stroke-width="1" stroke-dasharray="4 3"/>
+                <text class="svg-s" x="890" y="153" text-anchor="middle" fill="#ff4d9d">publish</text>
+              </g>
+              <g class="svg-line" stroke="#6b7f99">
+                <line x1="180" y1="148" x2="194" y2="148" marker-end="url(#m3)"/>
+                <line x1="336" y1="148" x2="350" y2="148" marker-end="url(#m3)"/>
+                <line x1="492" y1="148" x2="506" y2="148" marker-end="url(#m3)"/>
+                <line x1="648" y1="148" x2="662" y2="148" marker-end="url(#m3)"/>
+                <line x1="804" y1="148" x2="818" y2="148" marker-end="url(#m3)"/>
+              </g>
+
+              <text class="svg-s" x="42" y="196" fill="#4b5c74">reads the subscription cache — no callbacks, no cross-thread events</text>
+              <text class="svg-s" x="958" y="196" text-anchor="end" fill="#4b5c74">every 3rd tick · one transaction, every car</text>
+              <text class="svg-s" x="42" y="228" fill="#4b5c74">6.1 µs of a 16 667 µs budget, with 7 cars simulated</text>
+            </svg>
+          </div>
+          <figcaption>
+            <b>Six stages, then a conditional publish.</b> The loop sleeps until 1.5 ms before the tick
+            boundary and then spins, because no mainstream scheduler wakes a thread accurately enough for
+            60 Hz. That buys a rock-steady 60.0 Hz for a little CPU.
+          </figcaption>
+        </figure>
+
+        <div class="prose">
+          <h3>Pull, don't subscribe to callbacks</h3>
+          <p>
+            The obvious way to consume input is <code>on_insert</code>/<code>on_update</code> handlers.
+            This sidecar doesn't. Each tick it just iterates the materialized view the SDK already keeps
+            for it — <code>conn.db.input().iter()</code> — and reads what is there right now.
+          </p>
+          <p>
+            With a couple of dozen rows that costs nothing and removes an entire class of ordering bug:
+            there is no queue to drain, no event that can land mid-step, no lock between a callback
+            thread and the simulation. The loop is single-threaded and reads a consistent snapshot at a
+            point it chose. Worth copying unless your row count makes a full scan expensive.
+          </p>
+        </div>
+      </section>
+
+      <!-- ============================================================ 5 -->
+      <section id="schedule">
+        <div class="kicker"><span>Scheduling inputs</span><span class="lane lane-sidecar">sidecar</span></div>
+        <div class="prose">
+          <h2>An input is stamped with the tick it drives, and waits for it.</h2>
+          <p>
+            This is the detail that turns &ldquo;close enough&rdquo; prediction into exact prediction, and it is
+            easy to miss. The client runs a few ticks ahead of the authority and stamps every input with
+            the tick it belongs to. The sidecar does <em>not</em> apply inputs on arrival — it queues them
+            and promotes each one when its own clock reaches that tick.
+          </p>
+        </div>
+
+        <div class="code">
+          <header><span>sidecar/src/authority.rs · pull_inputs</span><em>promote what is due</em></header>
+<pre><span class="c">// `world.tick` is still the pre-step value: the input for tick T is the one
+// applied during the step that takes the world from T to T+1 — the same
+// convention the client uses.</span>
+<span class="k">let</span> now = <span class="k">self</span>.world.tick;
+<span class="k">for</span> slot <span class="k">in</span> <span class="n">0</span>..MAX_CARS {
+    <span class="k">let</span> Some(state) = <span class="k">self</span>.slots[slot].as_mut() <span class="k">else</span> { <span class="k">continue</span> };
+
+    <span class="k">while</span> state.pending.front().is_some_and(|(t, _)| *t &lt;= now) {
+        state.current = state.pending.pop_front().unwrap().<span class="n">1</span>;
+    }
+    <span class="c">// Nothing due but a backlog waiting means the client clock drifted
+    // behind us; take the oldest rather than stall.</span>
+    <span class="k">if</span> state.pending.len() &gt; <span class="n">12</span> {
+        state.current = state.pending.pop_front().unwrap().<span class="n">1</span>;
+    }
+    <span class="k">self</span>.world.inputs[slot] = state.current;
+}</pre>
+        </div>
+
+        <div class="prose">
+          <p>
+            Three cases, all handled: an input that arrives <strong>early</strong> waits for its tick. One
+            that arrives <strong>late</strong> is applied immediately — there is no rewinding the authority —
+            and the client absorbs the difference on its next rollback. One that never arrives leaves
+            <code>state.current</code> holding the last controller reading, which is why packet loss shows up
+            as the authority briefly disagreeing rather than the car cutting its engine.
+          </p>
+          <p>
+            The queue is capped at 64 entries so a client with a wildly wrong clock cannot make the
+            sidecar allocate forever, and <code>set_input</code> in the module rejects any sequence number
+            it has already seen, so a reordered packet can never walk the controls backwards.
+          </p>
+        </div>
+      </section>
+
+      <!-- ============================================================ 6 -->
+      <section id="client">
+        <div class="kicker"><span>The client half</span><span class="lane lane-browser">browser</span></div>
+        <div class="prose">
+          <h2>Predict, reconcile, smooth.</h2>
+          <p>
+            Everything so far works without a line of client-side physics: subscribe to
+            <code>car_state</code>, interpolate, draw. You need this section only if the latency between
+            an input and its visible effect matters — in a racing game it does.
+          </p>
+          <ol class="steps">
+            <li><b>Predict</b> Every tick, sample the controls, step the local car in wasm immediately, and store <code>(tick, input, resulting state)</code> in a 256-entry ring buffer. Steering has zero input lag regardless of ping.</li>
+            <li><b>Reconcile</b> A snapshot arrives carrying the authority's state for some tick <code>T</code> in the recent past. Compare it against what was recorded for <code>T</code>. If they differ by more than 1.5 mm, rewind to the authoritative state and replay the stored inputs from <code>T+1</code> to now — typically 5 to 20 ticks, about 20 µs of work.</li>
+            <li><b>Smooth</b> A rewind moves the car, which would read as a stutter. Instead keep the difference between where the car <em>appeared</em> to be and where it now <em>is</em> as a visual offset, and decay that to zero over ~220 ms. The simulation is corrected instantly; the picture catches up.</li>
+          </ol>
+        </div>
+
+        <figure>
+          <div class="scroller">
+            <svg viewBox="0 0 1000 292" role="img" aria-label="Both timelines are indexed by tick number. The client runs seven ticks ahead of the sidecar. A snapshot for tick 1231 travels up to the client and is compared against its own history for that tick; an input stamped 1240 travels down and waits until the authority reaches that tick.">
+              <defs>
+                <marker id="m4a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                  <path d="M0 0 L10 5 L0 10 z" fill="#ffc857"/>
+                </marker>
+                <marker id="m4c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+                  <path d="M0 0 L10 5 L0 10 z" fill="#38e8ff"/>
+                </marker>
+              </defs>
+
+              <text class="svg-h" x="60" y="24" fill="#38e8ff">CLIENT · predicts ahead</text>
+              <path d="M500 50 L500 44 L896 44 L896 50" fill="none" stroke="#38e8ff" stroke-width="1"/>
+              <text class="svg-s" x="698" y="36" text-anchor="middle" fill="#38e8ff">rewind to T, replay 9 ticks · ~9 µs</text>
+
+              <line x1="60" y1="76" x2="940" y2="76" stroke="rgba(120,170,220,0.30)" stroke-width="1"/>
+              <g stroke="#6b7f99" stroke-width="1">
+                <line x1="60" y1="70" x2="60" y2="82"/><line x1="104" y1="70" x2="104" y2="82"/><line x1="148" y1="70" x2="148" y2="82"/>
+                <line x1="192" y1="70" x2="192" y2="82"/><line x1="236" y1="70" x2="236" y2="82"/><line x1="280" y1="70" x2="280" y2="82"/>
+                <line x1="324" y1="70" x2="324" y2="82"/><line x1="368" y1="70" x2="368" y2="82"/><line x1="412" y1="70" x2="412" y2="82"/>
+                <line x1="456" y1="70" x2="456" y2="82"/><line x1="544" y1="70" x2="544" y2="82"/>
+                <line x1="588" y1="70" x2="588" y2="82"/><line x1="632" y1="70" x2="632" y2="82"/><line x1="676" y1="70" x2="676" y2="82"/>
+                <line x1="720" y1="70" x2="720" y2="82"/><line x1="764" y1="70" x2="764" y2="82"/><line x1="808" y1="70" x2="808" y2="82"/>
+                <line x1="852" y1="70" x2="852" y2="82"/>
+              </g>
+              <circle cx="500" cy="76" r="5" fill="#090d15" stroke="#38e8ff" stroke-width="1.6"/>
+              <circle cx="896" cy="76" r="5.5" fill="#38e8ff"/>
+              <text class="svg-s" x="896" y="62" text-anchor="middle" fill="#38e8ff">now</text>
+
+              <line class="svg-line" x1="500" y1="192" x2="500" y2="88" stroke="#ffc857" marker-end="url(#m4a)"/>
+              <text class="svg-s" x="488" y="128" text-anchor="end" fill="#ffc857">snapshot for T</text>
+              <text class="svg-s" x="488" y="144" text-anchor="end" fill="#4b5c74">compared with the</text>
+              <text class="svg-s" x="488" y="158" text-anchor="end" fill="#4b5c74">state recorded for T</text>
+
+              <line class="svg-line" x1="896" y1="88" x2="896" y2="192" stroke="#38e8ff" marker-end="url(#m4c)"/>
+              <text class="svg-s" x="884" y="128" text-anchor="end" fill="#38e8ff">set_input(tick = 1240)</text>
+              <text class="svg-s" x="884" y="144" text-anchor="end" fill="#4b5c74">held until the authority</text>
+              <text class="svg-s" x="884" y="158" text-anchor="end" fill="#4b5c74">clock reaches 1240</text>
+
+              <line x1="60" y1="200" x2="588" y2="200" stroke="rgba(120,170,220,0.30)" stroke-width="1"/>
+              <line x1="588" y1="200" x2="940" y2="200" stroke="rgba(120,170,220,0.22)" stroke-width="1" stroke-dasharray="4 5"/>
+              <g stroke="#6b7f99" stroke-width="1">
+                <line x1="60" y1="194" x2="60" y2="206"/><line x1="104" y1="194" x2="104" y2="206"/><line x1="148" y1="194" x2="148" y2="206"/>
+                <line x1="192" y1="194" x2="192" y2="206"/><line x1="236" y1="194" x2="236" y2="206"/><line x1="280" y1="194" x2="280" y2="206"/>
+                <line x1="324" y1="194" x2="324" y2="206"/><line x1="368" y1="194" x2="368" y2="206"/><line x1="412" y1="194" x2="412" y2="206"/>
+                <line x1="456" y1="194" x2="456" y2="206"/><line x1="544" y1="194" x2="544" y2="206"/>
+              </g>
+              <circle cx="500" cy="200" r="5" fill="#090d15" stroke="#ff4d9d" stroke-width="1.6"/>
+              <circle cx="588" cy="200" r="5.5" fill="#ff4d9d"/>
+              <text class="svg-s" x="500" y="222" text-anchor="middle">T = 1231</text>
+              <text class="svg-s" x="588" y="222" text-anchor="middle" fill="#ff4d9d">now = 1233</text>
+              <text class="svg-s" x="896" y="222" text-anchor="middle" fill="#4b5c74">1240</text>
+              <text class="svg-h" x="60" y="244" fill="#ff4d9d">SIDECAR · the authority</text>
+
+              <path d="M588 258 L588 264 L896 264 L896 258" fill="none" stroke="#5ef2a8" stroke-width="1"/>
+              <text class="svg-s" x="742" y="278" text-anchor="middle" fill="#5ef2a8">lead = round-trip + 2 ticks</text>
+            </svg>
+          </div>
+          <figcaption>
+            <b>Both lines are indexed by tick number, not wall clock.</b> That is what makes the two
+            vertical arrows possible: an input and a snapshot both name a tick, so each one lands on a
+            specific column rather than &ldquo;whenever it arrives&rdquo;. If the two states for column T agree
+            within 1.5 mm and 0.0008 rad, nothing is replayed at all.
+          </figcaption>
+        </figure>
+
+        <div class="prose">
+          <h3>The clock is what has to be right</h3>
+          <p>
+            For prediction to be exact, an input stamped for tick <code>T</code> must be applied by the
+            authority <em>at</em> tick <code>T</code>. So the client estimates where the sidecar's clock is
+            now, adds a round trip plus two ticks of margin, and steers its own tick rate by up to ±6 % to
+            hold that lead — a time dilation you cannot feel. Drag the slider:
+          </p>
+        </div>
+
+        <div class="rig">
+          <div class="card-title">Lead, as a function of latency</div>
+          <label for="lat">added latency <b id="lat-v">0 ms</b></label>
+          <input type="range" id="lat" min="0" max="400" step="10" value="0">
+          <div class="rig-out">
+            <div class="o-rtt"><span>round trip</span><b id="o-rtt">50 ms</b></div>
+            <div class="o-lead"><span>client lead</span><b id="o-lead">+5 ticks</b></div>
+            <div class="o-lag"><span>input lag</span><b id="o-lag">0 ms</b></div>
+          </div>
+          <p class="rig-foot">
+            lead = round(rtt × 60 / 1000) + 2 &nbsp;·&nbsp; assumes a 50 ms base round trip.
+            The car keeps steering instantly at every setting; what grows is how far into the future the
+            client is simulating, and therefore how much it replays when a correction lands.
+          </p>
+        </div>
+
+        <div class="prose">
+          <h3>Other cars are colliders, not simulations</h3>
+          <p>
+            The client never simulates a rival. It interpolates their published poses ~4 ticks in the past
+            and parks them in the wasm world as immovable colliders, so you can lean on someone mid-corner
+            and your own prediction reacts at once, while never claiming to own their state.
+            <code>World::step</code> takes a simulation mask for exactly this: the sidecar passes every car,
+            the browser passes only its own.
+          </p>
+        </div>
+      </section>
+
+      <!-- ============================================================ 7 -->
+      <section id="determinism">
+        <div class="kicker"><span>Determinism</span><span class="lane lane-browser">browser</span> </div>
+        <div class="prose">
+          <h2>One crate, compiled twice, agreeing bit for bit.</h2>
+          <p>
+            The physics is a single dependency-free crate built two ways: an <code>rlib</code> linked into
+            the native sidecar, and a <code>cdylib</code> for <code>wasm32-unknown-unknown</code> loaded by
+            the browser. Not a port, not a reimplementation. That is what makes the measured prediction
+            error <em>zero</em> rather than <em>small</em>.
+          </p>
+          <p>Two things get in the way of that, and both need handling:</p>
+          <ul class="notes">
+            <li>
+              <strong>Transcendentals.</strong> <code>libm</code>'s <code>sinf</code> on x86-64 and the one
+              linked into a wasm module are not guaranteed to agree in the last ulp, and one ulp compounds
+              over a few hundred ticks into a visible desync. So <code>sin</code>, <code>cos</code>,
+              <code>atan</code> and <code>atan2</code> are hand-rolled polynomials evaluated with nothing but
+              <code>+</code>, <code>-</code> and <code>*</code>, which are IEEE-754 exact everywhere.
+              <code>sqrt</code> is correctly rounded by the standard and is used directly.
+            </li>
+            <li>
+              <strong>FMA contraction.</strong> If the compiler fuses <code>a * b + c</code> into a single
+              multiply-add, the native build rounds once where wasm — which has no FMA instruction — rounds
+              twice. Rust does not contract by default, so the rule is simply: never build this workspace
+              with <code>-C target-cpu=native</code>.
+            </li>
+          </ul>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Verify it, don't assume it</div>
+          <p>
+            <code>node scripts/verify-determinism.mjs</code> runs the same 1200-tick scripted race through
+            both builds and diffs the raw <code>f32</code> bits at ten checkpoints. A determinism claim you
+            do not test is a determinism claim that will quietly stop being true.
+          </p>
+        </div>
+
+        <div class="prose">
+          <h3>Getting state across the boundary for free</h3>
+          <p>
+            <code>CarState</code> is <code>#[repr(C)]</code> and entirely <code>f32</code> — 24 of them —
+            so the browser maps it with a single <code>Float32Array</code> over wasm linear memory and reads
+            and writes the simulation in place, with no serialization on the hot path. The whole core is a
+            38 KB <code>.wasm</code> with zero imports: no wasm-bindgen, no wasm-pack, no build plugin.
+            All allocation happens inside <code>phys_init</code>, so nothing later grows memory and detaches
+            the views.
+          </p>
+        </div>
+      </section>
+
+      <!-- ============================================================ 8 -->
+      <section id="restart">
+        <div class="kicker"><span>Restarts</span><span class="lane lane-sidecar">sidecar</span></div>
+        <div class="prose">
+          <h2>The outbox is the save file.</h2>
+          <p>
+            A sidecar holds all the simulation state in memory, which sounds like the fragile part. It
+            isn't, because everything the integrator reads back is already on the wire. Kill the process and
+            start it again and it will:
+          </p>
+          <ul class="notes">
+            <li>re-claim authority, since the previous holder is now disconnected;</li>
+            <li>resume the tick counter at <code>config.server_tick + 1</code> — start from zero instead and the module silently rejects every snapshot as out of order;</li>
+            <li>adopt every car from its last published <code>car_state</code> row: position, velocity, steering angle, lap, the lot;</li>
+            <li>reconcile the bot field back to its configured count, keeping whoever is already out there.</li>
+          </ul>
+          <p>
+            Drivers keep their momentum through a restart. What is missing is a <em>hot</em> standby: there is
+            a visible gap while the process comes up, and nothing arbitrates between two sidecars racing to
+            claim after a network partition.
+          </p>
+          <p>
+            The general lesson for your own sidecar: <strong>publish enough state to resume from</strong>.
+            The two fields this simulation does not put on the wire (<code>slip_f</code>, <code>slip_r</code>)
+            are overwritten before they are ever read, so reconstructing them as zero is exact rather than
+            approximate — that is a property worth checking deliberately, not assuming.
+          </p>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Deploy them together</div>
+          <p>
+            Database and sidecar talk on the hot path: every input as it lands, twenty snapshots a second, at
+            a fixed 60 Hz that cannot slip. In this demo they ship as <em>one container</em> so that link stays
+            on loopback instead of becoming a network. The browser client is static and goes to the edge
+            separately; its only conversation is one <code>wss://</code> back to the pair.
+          </p>
+        </div>
+      </section>
+
+      <!-- ============================================================ 9 -->
+      <section id="size">
+        <div class="kicker"><span>The size of it</span><span class="lane lane-sidecar">server</span></div>
+        <div class="prose">
+          <h2>994 lines is the whole authority.</h2>
+          <p>
+            The other cost worth quoting is how much of this you have to write. Everything
+            that makes the server the server — the schema, the identity check, the tick
+            loop, the publish — is three hand-written files.
+          </p>
+        </div>
+
+        <div class="tbl scroller">
+          <table>
+            <caption>scc, hand-written files only</caption>
+            <thead>
+              <tr><th scope="col">File</th><th scope="col">Code</th><th scope="col">What is in it</th></tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row">module/src/lib.rs</th><td class="num">465</td><td>tables, the inbox, the registry, the outbox, the identity check</td></tr>
+              <tr><th scope="row">sidecar/src/authority.rs</th><td class="num">303</td><td>one tick: sync the grid, schedule inputs, simulate, publish</td></tr>
+              <tr><th scope="row">sidecar/src/main.rs</th><td class="num">226</td><td>connect, subscribe, claim, and hold 60 Hz</td></tr>
+              <tr class="sum srv"><th scope="row">the authority</th><td class="num">994</td><td>everything that makes the server the server</td></tr>
+              <tr><th scope="row">web/src/sim.ts</th><td class="num">337</td><td>predict, rewind, replay, smooth</td></tr>
+              <tr><th scope="row">web/src/net.ts</th><td class="num">317</td><td>subscriptions, clock estimate, entity interpolation</td></tr>
+              <tr><th scope="row">web/src/main.ts</th><td class="num">12</td><td>the clock steering that holds the lead</td></tr>
+              <tr class="sum cli"><th scope="row">the netcode</th><td class="num">666</td><td>everything that hides the round trip</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="prose">
+          <p>
+            For scale, <code>physics/src</code> is <strong>1609</strong> lines. The simulation
+            is larger than everything that makes it authoritative — and it is the part you
+            would have to write wherever you chose to run it. <code>spacetime generate</code>
+            emits another <strong>3100</strong> across 42 files that nobody reads.
+          </p>
+        </div>
+
+        <p class="pull">
+          Narrow it to the trust model itself and it is 104 lines.<br>A quarter of those are
+          one reducer copying a struct field by field.
+        </p>
+
+        <div class="prose">
+          <p>
+            <code>claim_authority</code>, <code>release_authority</code>,
+            <code>require_authority</code>, <code>set_input</code> and
+            <code>push_states</code> together — 24 of <code>push_states</code>' 46 lines
+            being the <code>StateUpdate</code> to <code>CarState</code> copy. Those five are
+            the whole mechanism: the database no longer runs the physics, but it is still
+            the only thing that can say where a car is. And because the security of the
+            arrangement rests on 104 lines rather than on a codebase, you can read all of
+            it before deciding to trust it.
+          </p>
+        </div>
+      </section>
+
+      <!-- ============================================================ 10 -->
+      <section id="build">
+        <div class="kicker"><span>Build your own</span><span class="lane">any workload</span></div>
+        <div class="prose">
+          <h2>The pattern, minus the cars.</h2>
+          <p>
+            Nothing above is specific to vehicle dynamics. The same shape fits pathfinding, economy
+            simulation, matchmaking, procedural generation, ML inference — anything that is expensive,
+            runs continuously, and must stay authoritative. The recipe:
+          </p>
+          <ol class="steps">
+            <li><b>Split the schema into inbox, registry, outbox</b> Clients write intent to the inbox. The registry says who is who and which identity may write results. The outbox holds the computed truth and nothing else writes to it.</li>
+            <li><b>Gate the result reducer on identity</b> One <code>require_authority(ctx)?</code> at the top of every reducer that writes results. Store the authorized identity in a config row — or, for production, bake it in at publish time rather than letting it be claimed.</li>
+            <li><b>Make the sidecar an ordinary client</b> Same SDK, same subscriptions, same auth. Nothing about it is privileged except the row with its identity in it.</li>
+            <li><b>Pull state, don't wire callbacks</b> Read the subscription cache at a point your loop chooses. It is a consistent view, it costs nothing at modest row counts, and it deletes a class of ordering bug.</li>
+            <li><b>Batch the writes</b> One reducer call carrying every changed entity, at a rate below your compute rate. Here that is 20 Hz snapshots against a 60 Hz simulation — a third of the transactions for the same fidelity.</li>
+            <li><b>Publish enough to resume from</b> If the outbox is a complete description of your computation's state, a restart is a hiccup instead of a reset. Check that claim explicitly.</li>
+            <li><b>Decide whether clients predict</b> Only if input-to-pixel latency matters. If it does, the same source has to run on both sides, which makes determinism a hard requirement and a thing to test in CI.</li>
+          </ol>
+        </div>
+
+        <div class="tbl scroller">
+          <table>
+            <caption>What it cost here</caption>
+            <thead>
+              <tr><th scope="col">Measure</th><th scope="col">Figure</th><th scope="col">Against</th></tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row">simulation</th><td class="num">6.1 µs / tick</td><td>7 cars, 6 of them AI drivers, on a 16 667 µs budget — 0.0 %</td></tr>
+              <tr><th scope="row">transactions</th><td class="num">20 / s</td><td>one <code>push_states</code> per 3 ticks, all cars in one call</td></tr>
+              <tr><th scope="row">client uplink</th><td class="num">30 / s</td><td>one <code>set_input</code> row, overwritten</td></tr>
+              <tr><th scope="row">browser core</th><td class="num">38 KB</td><td>wasm with zero imports; 10 000 ticks in 10 ms in Node</td></tr>
+              <tr><th scope="row">rollback</th><td class="num">~20 µs</td><td>20 replayed ticks — affordable on every snapshot</td></tr>
+              <tr><th scope="row">prediction error</th><td class="num">0.000 m</td><td>local link, and across a ~90 ms round trip to <code>us-east4</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ============================================================ 11 -->
+      <section id="gaps">
+        <div class="kicker"><span>Honest gaps</span><span class="lane">proof of concept</span></div>
+        <div class="prose">
+          <h2>What this does not solve.</h2>
+          <ul class="notes">
+            <li><strong>One authority, no hot standby.</strong> Handover is clean but not instant: there is a visible gap while a replacement comes up, and nothing arbitrates between two sidecars racing to claim after a partition.</li>
+            <li><strong><code>input</code> is a public table</strong> so the sidecar can subscribe to it. A real deployment would put a row-level security filter on it so players cannot read each other's controls.</li>
+            <li><strong>Rollback ignores contact history.</strong> Replayed ticks collide against remote cars at their <em>current</em> interpolated poses, not their historical ones. Standard practice, small resulting error, but an approximation — unlike everything else here.</li>
+            <li><strong>No lag compensation for contact.</strong> Cars are interpolated ~70 ms in the past; a side-by-side pass is resolved by the authority against its own timeline.</li>
+            <li><strong>No anti-cheat on input rate.</strong> A client could spam <code>set_input</code> faster than 30 Hz. The scheduler bounds the damage to &ldquo;very responsive controls&rdquo;.</li>
+            <li><strong>Busy-waiting on the tick boundary.</strong> A little CPU spent to hold 60.0 Hz exactly. Windows needs it most; Linux and macOS overshoot too.</li>
+          </ul>
+        </div>
+      </section>
+
+      <footer>
+        <div>Neon Bay · a physics sidecar for SpacetimeDB · MIT</div>
+        <div>Figures are the project's own measurements: the sidecar status line, <code>cargo test -p physics --release</code>, and <code>scripts/verify-determinism.mjs</code>.</div>
+        <div><a href="/">Drive it</a> — <kbd>WASD</kbd>, then press <em>Desync me</em> and watch the authority pull you back.</div>
+      </footer>
+
+    </main>
+  </div>
+</div>
+
+<script>
+  // The lead calculator mirrors main.ts: targetTick = serverNow + rttTicks + LEAD_MARGIN.
+  (function () {
+    var BASE_RTT = 50, LEAD_MARGIN = 2;
+    var slider = document.getElementById('lat');
+    var out = {
+      lat: document.getElementById('lat-v'),
+      rtt: document.getElementById('o-rtt'),
+      lead: document.getElementById('o-lead'),
+      lag: document.getElementById('o-lag')
+    };
+    function update() {
+      var added = Number(slider.value);
+      var rtt = BASE_RTT + added;
+      var lead = Math.round((rtt / 1000) * 60) + LEAD_MARGIN;
+      out.lat.textContent = added + ' ms';
+      out.rtt.textContent = rtt + ' ms';
+      out.lead.textContent = '+' + lead + ' ticks';
+      out.lag.textContent = '0 ms';
+    }
+    slider.addEventListener('input', update);
+    update();
+  })();
+</script>
+</body>
+</html>

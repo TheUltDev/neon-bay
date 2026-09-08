@@ -1,0 +1,23 @@
+[package]
+name = "physics-sidecar-module"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+license = "MIT"
+description = "SpacetimeDB module: inbox, registry and outbox for the physics sidecar. No simulation."
+
+# Standalone on purpose -- `spacetime publish` runs its own cargo build against
+# wasm32-unknown-unknown and is happiest outside the native workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+spacetimedb = "2.8"
+log = "0.4"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

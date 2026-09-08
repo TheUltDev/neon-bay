@@ -1,0 +1,27 @@
+# Workspace for the native side of the demo.
+#
+# `module/` is deliberately NOT a member: `spacetime publish` drives its own
+# cargo invocation against wasm32-unknown-unknown and is happiest with a
+# standalone crate.
+[workspace]
+resolver = "2"
+members = ["physics", "sidecar"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+# 1.79 for inline `const` blocks in array initializers. Declared so an older
+# toolchain reports that plainly instead of failing to parse the source.
+rust-version = "1.79"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Physics determinism depends on the compiler not contracting `a * b + c` into a
+# fused multiply-add (wasm has no FMA instruction, so an FMA-enabled native build
+# would drift from the browser). Rust does not contract by default -- just never
+# build this workspace with `-C target-cpu=native`.

@@ -1,0 +1,23 @@
+{
+  "name": "physics-sidecar-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 5173",
+    "wasm": "node ../scripts/build-wasm.mjs",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "spacetimedb": "~2.8.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

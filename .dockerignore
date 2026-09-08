@@ -1,0 +1,18 @@
+# Docker's exception rules do not reliably reach into a directory its parent
+# already excluded, so this is a blacklist rather than a whitelist -- the same
+# result, with none of the ways to get it subtly wrong.
+.git/
+.github/
+
+# Build output. Huge, and rebuilt inside the image anyway; leaving it in the
+# context would invalidate a layer every time you ran cargo locally.
+**/target/
+**/node_modules/
+**/dist/
+*.log
+
+# The browser client is deployed separately (Cloudflare), and nothing in the
+# image reads it.
+web/
+
+.railway/

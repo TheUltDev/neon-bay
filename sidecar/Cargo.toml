@@ -1,0 +1,11 @@
+[package]
+name = "sidecar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Authoritative physics sidecar: a SpacetimeDB client that owns the simulation."
+
+[dependencies]
+physics = { path = "../physics" }
+spacetimedb-sdk = "2.8"
