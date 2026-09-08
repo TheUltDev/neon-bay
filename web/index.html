@@ -9,6 +9,10 @@
   </head>
   <body>
     <canvas id="stage"></canvas>
+    <!-- Sits over the canvas and under the HUD, exactly where the renderer used
+         to fill it. Static, so the compositor keeps it instead of the frame
+         loop repainting it. -->
+    <div id="vignette"></div>
 
     <!-- The HUD is three self-packing columns over a full-bleed canvas, with the
          hotkey bar on its own row underneath. Each column stacks its panels from
@@ -58,7 +62,7 @@
               </div>
               <div class="toggles">
                 <label><input type="checkbox" id="t-ghost" checked /> server ghost</label>
-                <label><input type="checkbox" id="t-rotate" /> rotate camera</label>
+                <label><input type="checkbox" id="t-rotate" checked /> rotate camera</label>
               </div>
             </section>
           </div>
@@ -93,6 +97,7 @@
             <section class="panel" id="net-panel">
               <div class="panel-title">Prediction &amp; reconciliation</div>
               <canvas id="errgraph" width="252" height="62"></canvas>
+              <div class="kv"><label>client fps</label><b id="k-fps">—</b></div>
               <div class="kv"><label>round trip</label><b id="k-rtt">—</b></div>
               <div class="kv"><label>prediction error</label><b id="k-err">0.000 m</b></div>
               <div class="kv"><label>smoothing out</label><b id="k-smooth">0.000 m</b></div>

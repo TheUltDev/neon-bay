@@ -60,6 +60,7 @@ export interface WasmExports {
   phys_get(index: number, out: number): void;
   phys_set(index: number, src: number): void;
   phys_scratch_ptr(): number;
+  phys_fingerprint(): number;
   phys_car_floats(): number;
   phys_input_floats(): number;
   phys_max_cars(): number;
@@ -124,6 +125,14 @@ export class Sim {
   readonly consts: CarConsts;
   readonly stride: number;
 
+  /**
+   * What this `physics.wasm` computes, as one number. The authority publishes
+   * its own; if the two differ, this client and the sidecar are not running the
+   * same simulation and every prediction below is a guess. See
+   * `physics/src/fingerprint.rs`.
+   */
+  readonly fingerprint: number;
+
   /** Physics slot this client owns, or -1 while spectating. */
   localSlot = -1;
   /** Tick the client is currently simulating. Runs ahead of the server. */
@@ -165,6 +174,9 @@ export class Sim {
   constructor(wasm: WasmExports) {
     this.wasm = wasm;
     wasm.phys_init();
+    // Scored inside `phys_init`, where the module is still allowed to allocate;
+    // this is only reading the number back.
+    this.fingerprint = wasm.phys_fingerprint() >>> 0;
     this.stride = wasm.phys_car_floats();
     const maxCars = wasm.phys_max_cars();
     this.cars = new Float32Array(wasm.memory.buffer, wasm.phys_cars_ptr(), maxCars * this.stride);

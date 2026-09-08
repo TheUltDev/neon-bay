@@ -7,6 +7,25 @@
 // Static geometry (track surface, curbs, start line) is baked into Path2D
 // objects once at load. Skid marks accumulate into an offscreen world-space
 // canvas so they persist without a growing list of quads.
+//
+// Two rules keep it quick. Canvas2D hides an enormous range of cost behind
+// calls that all look alike, and how much it hides varies by browser -- what
+// Chrome absorbs on the GPU, a software rasterizer pays for line by line:
+//
+//   * no `shadowBlur` on anything larger than a car. A blurred shadow is
+//     rendered into a scratch surface the size of the path's bounding box, and
+//     the track's bounding box is the entire circuit. Stroking the two barriers
+//     that way measured at 16 ms a frame on its own; the stacked strokes that
+//     replaced it come to 0.5 ms.
+//   * geometry that never moves is baked at load and drawn as a path, not
+//     rebuilt from a loop every frame. That is the chequered flag, and it is
+//     why the road surface is one fill of a pre-tinted tile rather than a fill
+//     plus a glaze.
+//
+// What is *not* worth doing, measured rather than assumed: caching the
+// full-screen gradients (the fill dominates, not building the ramp), and
+// clipping the skid layer's blit to the visible corner (the cost is
+// destination pixels, not source ones).
 
 import type { Sim, TrackData } from './sim';
 
@@ -39,6 +58,18 @@ const MAX_PARTICLES = 700;
 const TIRE_WIDTH = 0.4;
 /** A streak breaks if its wheel stopped marking for longer than this, in ms. */
 const CONTACT_GAP = 120;
+/**
+ * The neon barrier glow, widest and faintest first, as [line width, alpha].
+ *
+ * Three stacked strokes rather than one stroke plus `shadowBlur`: same falloff,
+ * and it costs three passes over a polyline instead of a Gaussian blur across a
+ * scratch surface the size of the entire track.
+ */
+const EDGE_GLOW = [
+  [2.4, 0.06],
+  [1.2, 0.14],
+  [0.42, 1],
+] as const;
 
 interface Particle {
   x: number;
@@ -64,6 +95,8 @@ export class Renderer {
   private curbB = new Path2D();
   private centerLine = new Path2D();
   private startLine = new Path2D();
+  private chequerA = new Path2D();
+  private chequerB = new Path2D();
 
   // world-space layers
   private marks: HTMLCanvasElement;
@@ -77,12 +110,16 @@ export class Renderer {
   private particles: Particle[] = [];
   private partIdx = 0;
 
+  // cached paint
+  private bodyGrad = new Map<number, CanvasGradient>();
+  private beamGrad: CanvasGradient | null = null;
+
   // camera
   camX = 0;
   camY = 0;
   camZoom = 15;
   camRot = 0;
-  rotateCamera = false;
+  rotateCamera = true;
   showGhost = true;
   private shake = 0;
   private lastMarkFade = 0;
@@ -182,20 +219,54 @@ export class Renderer {
     this.startLine.lineTo(rx + tx * D, ry + ty * D);
     this.startLine.lineTo(lx + tx * D, ly + ty * D);
     this.startLine.closePath();
+
+    // The chequer, laid out along the band rather than clipped out of an
+    // axis-aligned grid. Same picture; two fills a frame instead of clipping
+    // and then stamping several hundred squares whether or not the start line
+    // is even on screen.
+    const across = Math.hypot(rx - lx, ry - ly);
+    const ux = (rx - lx) / across;
+    const uy = (ry - ly) / across;
+    const SQ = 1.3;
+    const cols = Math.ceil(across / SQ);
+    const rows = Math.ceil(D / SQ);
+    for (let c = 0; c < cols; c++) {
+      for (let r = 0; r < rows; r++) {
+        const path = (c + r) % 2 === 0 ? this.chequerA : this.chequerB;
+        const a = Math.min(c * SQ, across);
+        const b = Math.min((c + 1) * SQ, across);
+        const d0 = Math.min(r * SQ, D);
+        const d1 = Math.min((r + 1) * SQ, D);
+        path.moveTo(lx + ux * a + tx * d0, ly + uy * a + ty * d0);
+        path.lineTo(lx + ux * b + tx * d0, ly + uy * b + ty * d0);
+        path.lineTo(lx + ux * b + tx * d1, ly + uy * b + ty * d1);
+        path.lineTo(lx + ux * a + tx * d1, ly + uy * a + ty * d1);
+        path.closePath();
+      }
+    }
   }
 
+  /**
+   * The road surface, as one opaque noise tile.
+   *
+   * The base colour is baked into the tile rather than laid down first and then
+   * glazed with translucent noise: the track outline is an 800-segment path and
+   * filling it is not cheap, so it is worth filling once.
+   */
   private makeAsphalt() {
     const size = 128;
     const c = document.createElement('canvas');
     c.width = c.height = size;
     const g = c.getContext('2d')!;
     const img = g.createImageData(size, size);
+    // What #14181f glazed with the old translucent grain actually came out as,
+    // mean and amplitude both.
     for (let i = 0; i < size * size; i++) {
-      const n = 128 + (Math.random() * 46 - 23);
-      img.data[i * 4] = n;
-      img.data[i * 4 + 1] = n;
-      img.data[i * 4 + 2] = n + 4;
-      img.data[i * 4 + 3] = 20;
+      const n = (Math.random() * 46 - 23) * 0.0392;
+      img.data[i * 4] = 24 + n;
+      img.data[i * 4 + 1] = 28 + n;
+      img.data[i * 4 + 2] = 35 + n;
+      img.data[i * 4 + 3] = 255;
     }
     g.putImageData(img, 0, 0);
     this.asphalt = this.ctx.createPattern(c, 'repeat');
@@ -338,6 +409,18 @@ export class Renderer {
 
   // ----------------------------------------------------------------- draw --
 
+  /** World-space radius that certainly covers the viewport, whatever the
+   *  camera rotation, plus room for a car straddling the edge. */
+  private viewReach(w: number, h: number): number {
+    return Math.hypot(w, h) / 2 / this.camZoom + 6;
+  }
+
+  private inView(x: number, y: number, reach: number): boolean {
+    const dx = x - this.camX;
+    const dy = y - this.camY;
+    return dx * dx + dy * dy < reach * reach;
+  }
+
   draw(cars: DrawCar[], ghost: GhostCar | null, dt: number, localSpeed: number) {
     const ctx = this.ctx;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -349,13 +432,15 @@ export class Renderer {
     }
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = '#04060b';
-    ctx.fillRect(0, 0, w, h);
-
+    // No clear: the backdrop is opaque and covers the canvas.
     this.drawBackdrop(w, h);
 
     const shakeX = this.shake > 0.2 ? rnd(this.shake * 0.5) : 0;
     const shakeY = this.shake > 0.2 ? rnd(this.shake * 0.5) : 0;
+
+    // A full grid is two dozen cars, and the camera holds about a tenth of the
+    // circuit -- most of them are somewhere else entirely.
+    const reach = this.viewReach(w, h);
 
     ctx.save();
     ctx.translate(w / 2 + shakeX, h / 2 + shakeY);
@@ -365,16 +450,19 @@ export class Renderer {
 
     this.drawTrack(ctx);
     this.drawMarks(ctx);
-    for (const c of cars) if (!c.isLocal) this.drawCar(ctx, c);
+    for (const c of cars) if (!c.isLocal && this.inView(c.x, c.y, reach)) this.drawCar(ctx, c);
     if (ghost && this.showGhost) this.drawGhost(ctx, ghost);
     for (const c of cars) if (c.isLocal) this.drawCar(ctx, c);
-    this.drawParticles(ctx, dt);
+    this.drawParticles(ctx, dt, reach);
 
     ctx.restore();
 
     this.drawNameplates(ctx, cars, w, h, shakeX, shakeY);
     this.drawSpeedLines(ctx, w, h, localSpeed);
-    this.drawVignette(ctx, w, h);
+    // The vignette is #vignette in the stylesheet, not a fill here. It never
+    // changes with anything but the window size, and blending a full-screen
+    // radial gradient into the canvas every frame cost more than the entire
+    // track did. As a static layer over the canvas the compositor owns it.
 
     // Marks fade slowly so a long session does not end up solid black.
     const now = performance.now();
@@ -428,16 +516,9 @@ export class Renderer {
   private drawTrack(ctx: CanvasRenderingContext2D) {
     ctx.save();
 
-    // Surface.
-    ctx.fillStyle = '#14181f';
+    // Surface. One fill: the tile is opaque and already the right colour.
+    ctx.fillStyle = this.asphalt ?? '#14181f';
     ctx.fill(this.surface, 'evenodd');
-    if (this.asphalt) {
-      ctx.save();
-      ctx.fillStyle = this.asphalt;
-      ctx.globalAlpha = 0.5;
-      ctx.fill(this.surface, 'evenodd');
-      ctx.restore();
-    }
 
     // Curbs.
     ctx.fillStyle = '#c8323f';
@@ -452,30 +533,23 @@ export class Renderer {
     ctx.stroke(this.centerLine);
     ctx.setLineDash([]);
 
-    // Neon barriers.
-    ctx.lineWidth = 0.42;
-    ctx.strokeStyle = '#38e8ff';
-    ctx.shadowColor = '#0ea5e9';
-    ctx.shadowBlur = 16;
-    ctx.stroke(this.edgeL);
-    ctx.strokeStyle = '#ff4d9d';
-    ctx.shadowColor = '#ec4899';
-    ctx.stroke(this.edgeR);
-    ctx.shadowBlur = 0;
-
-    // Start/finish chequer.
-    ctx.save();
-    ctx.clip(this.startLine);
-    const b = pathBounds(this.track);
-    const sq = 1.3;
-    for (let x = b.minX; x < b.maxX; x += sq) {
-      for (let y = b.minY; y < b.maxY; y += sq) {
-        const on = (Math.floor(x / sq) + Math.floor(y / sq)) % 2 === 0;
-        ctx.fillStyle = on ? '#f8fafc' : '#0f172a';
-        ctx.fillRect(x, y, sq, sq);
+    // Neon barriers, glowing by stacked stroke rather than by shadow.
+    for (const [path, rgb] of [
+      [this.edgeL, '56,232,255'],
+      [this.edgeR, '255,77,157'],
+    ] as const) {
+      for (const [width, alpha] of EDGE_GLOW) {
+        ctx.lineWidth = width;
+        ctx.strokeStyle = `rgba(${rgb},${alpha})`;
+        ctx.stroke(path);
       }
     }
-    ctx.restore();
+
+    // Start/finish chequer.
+    ctx.fillStyle = '#f8fafc';
+    ctx.fill(this.chequerA);
+    ctx.fillStyle = '#0f172a';
+    ctx.fill(this.chequerB);
 
     ctx.restore();
   }
@@ -523,11 +597,16 @@ export class Renderer {
       ctx.restore();
     }
 
-    // Body.
-    const g = ctx.createLinearGradient(0, -1, 0, 1);
-    g.addColorStop(0, shade(col, -0.35));
-    g.addColorStop(0.45, col);
-    g.addColorStop(1, shade(col, -0.55));
+    // Body. The gradient is in the car's own frame, which is the same frame
+    // for every car, so one per colour is enough for the whole grid.
+    let g = this.bodyGrad.get(c.color);
+    if (!g) {
+      g = ctx.createLinearGradient(0, -1, 0, 1);
+      g.addColorStop(0, shade(col, -0.35));
+      g.addColorStop(0.45, col);
+      g.addColorStop(1, shade(col, -0.55));
+      this.bodyGrad.set(c.color, g);
+    }
     ctx.fillStyle = g;
     ctx.shadowColor = col;
     ctx.shadowBlur = c.isLocal ? 22 : 12;
@@ -551,10 +630,12 @@ export class Renderer {
       ctx.fillStyle = 'rgba(255,244,214,0.95)';
       ctx.fillRect(1.92, -0.78, 0.2, 0.4);
       ctx.fillRect(1.92, 0.38, 0.2, 0.4);
-      const beam = ctx.createLinearGradient(2.1, 0, 12, 0);
-      beam.addColorStop(0, 'rgba(255,240,200,0.13)');
-      beam.addColorStop(1, 'rgba(255,240,200,0)');
-      ctx.fillStyle = beam;
+      if (!this.beamGrad) {
+        this.beamGrad = ctx.createLinearGradient(2.1, 0, 12, 0);
+        this.beamGrad.addColorStop(0, 'rgba(255,240,200,0.13)');
+        this.beamGrad.addColorStop(1, 'rgba(255,240,200,0)');
+      }
+      ctx.fillStyle = this.beamGrad;
       ctx.beginPath();
       ctx.moveTo(2.0, -0.8);
       ctx.lineTo(13, -3.6);
@@ -599,7 +680,7 @@ export class Renderer {
     ctx.restore();
   }
 
-  private drawParticles(ctx: CanvasRenderingContext2D, dt: number) {
+  private drawParticles(ctx: CanvasRenderingContext2D, dt: number, reach: number) {
     ctx.save();
     for (const p of this.particles) {
       if (!p || p.life <= 0) continue;
@@ -609,6 +690,9 @@ export class Renderer {
       p.vx *= 0.965;
       p.vy *= 0.965;
       if (p.life <= 0) continue;
+      // Smoke from a bot on the far side of the circuit still has to age, but
+      // it does not have to be rasterized.
+      if (!this.inView(p.x, p.y, reach)) continue;
       const t = p.life / p.maxLife;
       if (p.kind === 0) {
         const r = p.size * (2.2 - t * 1.2);
@@ -682,14 +766,6 @@ export class Renderer {
     }
     ctx.stroke();
     ctx.restore();
-  }
-
-  private drawVignette(ctx: CanvasRenderingContext2D, w: number, h: number) {
-    const g = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.35, w / 2, h / 2, Math.max(w, h) * 0.75);
-    g.addColorStop(0, 'rgba(0,0,0,0)');
-    g.addColorStop(1, 'rgba(0,0,0,0.55)');
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, w, h);
   }
 
   // ------------------------------------------------------------- minimap --
@@ -800,12 +876,4 @@ function edgeInset(
   const dy = cy - pt[1];
   const len = Math.hypot(dx, dy) || 1;
   return [pt[0] + (dx / len) * amount, pt[1] + (dy / len) * amount];
-}
-
-/** Bounds of the start/finish band, used to clip the chequer fill. */
-function pathBounds(track: TrackData) {
-  const x = track.points[0];
-  const y = track.points[1];
-  const w = track.halfWidth[0] + 4;
-  return { minX: x - w, minY: y - w, maxX: x + w, maxY: y + w };
 }

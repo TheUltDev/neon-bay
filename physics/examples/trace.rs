@@ -20,6 +20,12 @@ fn scripted(tick: u64) -> CarInput {
 }
 
 fn main() {
+    // First row is the fingerprint the sidecar publishes and the browser checks
+    // itself against at runtime. Diffing it here as well means the build-time
+    // check covers the mechanism the deployed system relies on, not just the
+    // arithmetic underneath it.
+    println!("fp   {:08x}", physics::fingerprint());
+
     let mut w = World::new();
     w.spawn(0, 0);
     w.spawn(1, 3);

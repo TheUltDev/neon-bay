@@ -1,5 +1,10 @@
 // HUD: the instrument panel, and the telemetry that makes the netcode visible.
 //
+// Roughly thirty readouts, repainted continuously. Writing to `textContent` or
+// to `style` invalidates layout even when the value has not moved, so every
+// write here goes through `set`/`css`, which remember what they last wrote and
+// do nothing if it still holds. On a steady lap that is most of them.
+//
 // The prediction-error graph is the point of the whole demo. On a healthy link
 // it sits pinned at zero, because the browser and the sidecar are running the
 // same instructions on the same inputs. Add latency or loss and it starts to
@@ -13,7 +18,9 @@ const $ = <T extends HTMLElement = HTMLElement>(id: string): T => {
 };
 
 export interface HudState {
-  authority: 'online' | 'offline' | 'connecting';
+  authority: 'online' | 'offline' | 'connecting' | 'mismatch';
+  /** Rendered frames per second, measured over the last half second. */
+  fps: number;
   serverTick: number;
   clientTick: number;
   lead: number;
@@ -62,9 +69,40 @@ export class Hud {
   private toastTimer = 0;
   private lastLeaderboard: string | null = null;
 
+  /** Element cache, so a repaint is not thirty `getElementById` calls. */
+  private els = new Map<string, HTMLElement>();
+  /** What each of those was last set to, keyed by element id plus property. */
+  private painted = new Map<string, string>();
+  private graphGrad: CanvasGradient | null = null;
+  private tachoGrad: CanvasGradient | null = null;
+
   constructor() {
     this.graph = $<HTMLCanvasElement>('errgraph').getContext('2d')!;
     this.tacho = $<HTMLCanvasElement>('tacho').getContext('2d')!;
+  }
+
+  private el(id: string): HTMLElement {
+    let e = this.els.get(id);
+    if (!e) {
+      e = $(id);
+      this.els.set(id, e);
+    }
+    return e;
+  }
+
+  /** Text, written only if it changed. */
+  private set(id: string, text: string) {
+    if (this.painted.get(id) === text) return;
+    this.painted.set(id, text);
+    this.el(id).textContent = text;
+  }
+
+  /** One style property, written only if it changed. */
+  private css(id: string, prop: 'color' | 'width' | 'left' | 'background', value: string) {
+    const key = `${id}.${prop}`;
+    if (this.painted.get(key) === value) return;
+    this.painted.set(key, value);
+    this.el(id).style[prop] = value;
   }
 
   pushError(e: number) {
@@ -81,42 +119,54 @@ export class Hud {
   }
 
   update(s: HudState) {
-    const dot = $('auth-dot');
-    dot.className = `dot ${s.authority === 'online' ? 'ok' : s.authority === 'offline' ? 'bad' : 'warn'}`;
-    $('auth-state').textContent =
+    const dot = `dot ${s.authority === 'online' ? 'ok' : s.authority === 'connecting' ? 'warn' : 'bad'}`;
+    if (this.painted.get('auth-dot.class') !== dot) {
+      this.painted.set('auth-dot.class', dot);
+      this.el('auth-dot').className = dot;
+    }
+    this.set(
+      'auth-state',
       s.authority === 'online'
         ? 'sidecar authoritative'
         : s.authority === 'offline'
           ? 'no authority'
-          : 'connecting…';
+          : s.authority === 'mismatch'
+            ? 'physics mismatch'
+            : 'connecting…',
+    );
 
-    $('k-servertick').textContent = s.serverTick.toLocaleString();
-    $('k-clienttick').textContent = s.clientTick.toLocaleString();
-    $('k-lead').textContent = `${s.lead >= 0 ? '+' : ''}${s.lead} ticks`;
+    this.set('k-servertick', s.serverTick.toLocaleString());
+    this.set('k-clienttick', s.clientTick.toLocaleString());
+    this.set('k-lead', `${s.lead >= 0 ? '+' : ''}${s.lead} ticks`);
 
-    $('k-rtt').textContent = s.rttMs > 0 ? `${s.rttMs.toFixed(0)} ms` : '—';
-    $('k-err').textContent = `${s.error.toFixed(3)} m`;
-    $('k-err').style.color = s.error > 0.25 ? 'var(--pink)' : s.error > 0.02 ? 'var(--amber)' : 'var(--green)';
-    $('k-smooth').textContent = `${s.smoothing.toFixed(3)} m`;
-    $('k-corr').textContent = `${s.correctionsPerSec.toFixed(1)} /s`;
-    $('k-replay').textContent = `${s.replayTicks}`;
-    $('k-snaps').textContent = s.snapshotHz > 0 ? `${s.snapshotHz.toFixed(1)} Hz` : '—';
-    $('k-dropped').textContent = `${s.droppedInputs}`;
-    $('k-dropped').style.color = s.droppedInputs > 0 ? 'var(--amber)' : 'var(--text)';
-    $('k-resync').textContent = `${s.resyncs}`;
+    this.set('k-fps', s.fps > 0 ? Math.round(s.fps).toString() : '—');
+    // The simulation is fixed-step, so a slow frame rate does not change what
+    // happens -- but it is the first thing to check when the demo feels wrong,
+    // and it is the one number here the client alone is responsible for.
+    this.css('k-fps', 'color', s.fps === 0 || s.fps >= 50 ? 'var(--text)' : s.fps >= 30 ? 'var(--amber)' : 'var(--pink)');
 
-    $('k-speed').textContent = Math.round(s.speedKph).toString();
-    $('k-gear').textContent = s.gear.toString();
-    $<HTMLElement>('bar-thr').style.width = `${Math.max(0, s.throttle) * 100}%`;
-    $<HTMLElement>('bar-brk').style.width = `${s.brake * 100}%`;
-    const str = $<HTMLElement>('bar-str');
-    str.style.width = `${Math.abs(s.steer) * 50}%`;
-    str.style.left = s.steer > 0 ? `${50 - Math.abs(s.steer) * 50}%` : '50%';
+    this.set('k-rtt', s.rttMs > 0 ? `${s.rttMs.toFixed(0)} ms` : '—');
+    this.set('k-err', `${s.error.toFixed(3)} m`);
+    this.css('k-err', 'color', s.error > 0.25 ? 'var(--pink)' : s.error > 0.02 ? 'var(--amber)' : 'var(--green)');
+    this.set('k-smooth', `${s.smoothing.toFixed(3)} m`);
+    this.set('k-corr', `${s.correctionsPerSec.toFixed(1)} /s`);
+    this.set('k-replay', `${s.replayTicks}`);
+    this.set('k-snaps', s.snapshotHz > 0 ? `${s.snapshotHz.toFixed(1)} Hz` : '—');
+    this.set('k-dropped', `${s.droppedInputs}`);
+    this.css('k-dropped', 'color', s.droppedInputs > 0 ? 'var(--amber)' : 'var(--text)');
+    this.set('k-resync', `${s.resyncs}`);
 
-    $('k-lap').textContent = s.lap > 0 ? s.lap.toString() : '–';
-    $('k-laptime').textContent = fmtTime(s.lapTime);
-    $('k-lastlap').textContent = s.lastLap > 0 ? fmtTime(s.lastLap) : '—';
-    $('k-bestlap').textContent = s.bestLap > 0 ? fmtTime(s.bestLap) : '—';
+    this.set('k-speed', Math.round(s.speedKph).toString());
+    this.set('k-gear', s.gear.toString());
+    this.css('bar-thr', 'width', `${(Math.max(0, s.throttle) * 100).toFixed(1)}%`);
+    this.css('bar-brk', 'width', `${(s.brake * 100).toFixed(1)}%`);
+    this.css('bar-str', 'width', `${(Math.abs(s.steer) * 50).toFixed(1)}%`);
+    this.css('bar-str', 'left', s.steer > 0 ? `${(50 - Math.abs(s.steer) * 50).toFixed(1)}%` : '50%');
+
+    this.set('k-lap', s.lap > 0 ? s.lap.toString() : '–');
+    this.set('k-laptime', fmtTime(s.lapTime));
+    this.set('k-lastlap', s.lastLap > 0 ? fmtTime(s.lastLap) : '—');
+    this.set('k-bestlap', s.bestLap > 0 ? fmtTime(s.bestLap) : '—');
 
     this.drawGraph(s.error);
     this.drawTacho(s.rpm, s.speedKph, s.gear);
@@ -167,10 +217,14 @@ export class Hud {
       const y = toY(v);
       i === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
     }
-    const grad = g.createLinearGradient(0, 0, 0, h);
-    grad.addColorStop(0, '#ff4d9d');
-    grad.addColorStop(0.55, '#ffc857');
-    grad.addColorStop(1, '#5ef2a8');
+    if (!this.graphGrad) {
+      const grad = g.createLinearGradient(0, 0, 0, h);
+      grad.addColorStop(0, '#ff4d9d');
+      grad.addColorStop(0.55, '#ffc857');
+      grad.addColorStop(1, '#5ef2a8');
+      this.graphGrad = grad;
+    }
+    const grad = this.graphGrad;
     g.strokeStyle = grad;
     g.lineWidth = 1.4;
     g.stroke();
@@ -235,11 +289,14 @@ export class Hud {
 
     const t = Math.max(0, Math.min(1, rpm));
     const aNow = a0 + (a1 - a0) * t;
-    const grad = g.createLinearGradient(0, 0, 150, 150);
-    grad.addColorStop(0, '#38e8ff');
-    grad.addColorStop(0.7, '#ffc857');
-    grad.addColorStop(1, '#ff4d9d');
-    g.strokeStyle = grad;
+    if (!this.tachoGrad) {
+      const grad = g.createLinearGradient(0, 0, 150, 150);
+      grad.addColorStop(0, '#38e8ff');
+      grad.addColorStop(0.7, '#ffc857');
+      grad.addColorStop(1, '#ff4d9d');
+      this.tachoGrad = grad;
+    }
+    g.strokeStyle = this.tachoGrad;
     g.lineWidth = 9;
     g.shadowColor = t > 0.85 ? '#ff4d9d' : '#38e8ff';
     g.shadowBlur = 16;

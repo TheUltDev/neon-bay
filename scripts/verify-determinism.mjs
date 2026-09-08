@@ -6,6 +6,12 @@
 // identical and only the simulation is under test) and print the raw f32 bits
 // of two cars. Any difference means client prediction would drift away from the
 // sidecar on its own, and every corner would need a visible correction.
+//
+// The first row is the fingerprint each build reports for itself -- the number
+// the sidecar publishes and the browser compares itself against at startup, so
+// a mismatched deploy says so instead of just mispredicting. Checking it here
+// too means the runtime check is verified by the same run that verifies the
+// physics it is guarding.
 
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -33,7 +39,7 @@ function runWasm() {
   const cars = new Float32Array(e.memory.buffer, e.phys_cars_ptr(), e.phys_max_cars() * stride);
   const inputs = new Float32Array(e.memory.buffer, e.phys_inputs_ptr(), e.phys_max_cars() * 4);
   const bits = new Uint32Array(cars.buffer, cars.byteOffset, cars.length);
-  const out = [];
+  const out = [`fp   ${(e.phys_fingerprint() >>> 0).toString(16).padStart(8, '0')}`];
   const row = (tick) => {
     for (let i = 0; i < 2; i++) {
       const b = i * stride;

@@ -11,11 +11,13 @@
 pub mod bot;
 pub mod car;
 pub mod ffi;
+pub mod fingerprint;
 pub mod math;
 pub mod track;
 pub mod world;
 
 pub use car::{CarInput, CarState, CAR_FLOATS, DT, INPUT_FLOATS, TICK_HZ};
+pub use fingerprint::fingerprint;
 pub use math::V2;
 pub use track::{Track, CHECKPOINTS, SAMPLES};
 pub use world::{World, MAX_CARS};
@@ -100,6 +102,41 @@ mod tests {
         );
         assert!(at_3s > 22.0, "0-3 s only reached {at_3s:.1} m/s");
         assert!(top > 55.0 && top < 90.0, "top speed {top:.1} m/s");
+    }
+
+    #[test]
+    fn a_provoked_spin_scrubs_off_and_stops() {
+        // Full lock and the handbrake at 144 km/h is the worst a player can do
+        // to themselves. It should cost them the corner, not two revolutions:
+        // the tires scrub, the car slows hard and the rotation stops.
+        let mut c = CarState::default();
+        c.vx = 40.0;
+        let mut yaw = 0.0f32;
+        let mut prev = c.heading;
+        for tick in 0..600u64 {
+            let held = tick < 90;
+            let inp = CarInput {
+                throttle: 0.0,
+                steer: if held { 1.0 } else { 0.0 },
+                brake: 0.0,
+                handbrake: if held { 1.0 } else { 0.0 },
+            };
+            for _ in 0..car::SUBSTEPS {
+                car::integrate(&mut c, &inp, car::H);
+            }
+            yaw += math::wrap_pi(c.heading - prev);
+            prev = c.heading;
+        }
+        let turns = yaw.abs().to_degrees() / 360.0;
+        println!(
+            "spin: {:.0} deg ({turns:.2} turns), 40.0 -> {:.1} m/s, omega {:.3}",
+            yaw.to_degrees(),
+            c.speed(),
+            c.omega
+        );
+        assert!(turns < 0.75, "car spun {turns:.2} turns");
+        assert!(c.speed() < 12.0, "still doing {:.1} m/s after a spin", c.speed());
+        assert!(c.omega.abs() < 0.05, "still rotating at {:.3} rad/s", c.omega);
     }
 
     #[test]

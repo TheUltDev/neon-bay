@@ -23,6 +23,11 @@ pub const TRACK_STRIDE: usize = 6;
 
 struct Bridge {
     world: Box<World>,
+    /// Computed here rather than on demand: [`crate::fingerprint`] builds a
+    /// second world to score, and building one allocates. Doing that later
+    /// would grow linear memory and detach every `Float32Array` the client
+    /// holds over it.
+    fingerprint: u32,
     track_buf: Vec<f32>,
     consts: Vec<f32>,
     /// One car's worth of staging space, so the client can hand a snapshot in
@@ -41,6 +46,7 @@ fn bridge() -> &'static mut Bridge {
             let consts = constants(&world.track);
             BRIDGE = Some(Bridge {
                 world,
+                fingerprint: crate::fingerprint(),
                 track_buf,
                 consts,
                 scratch: vec![0.0; CAR_FLOATS],
@@ -212,6 +218,13 @@ pub extern "C" fn phys_set(index: u32, src: *const f32) {
 #[no_mangle]
 pub extern "C" fn phys_scratch_ptr() -> *mut f32 {
     bridge().scratch.as_mut_ptr()
+}
+
+/// What this build of the physics computes, as one number. The client compares
+/// it against the one the authority published; see [`crate::fingerprint`].
+#[no_mangle]
+pub extern "C" fn phys_fingerprint() -> u32 {
+    bridge().fingerprint
 }
 
 #[no_mangle]

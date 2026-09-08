@@ -542,7 +542,7 @@ kbd {
       <div class="v-cyan"><dt>cost per tick</dt><dd>6.1 <small>µs</small></dd></div>
       <div><dt>tick budget used</dt><dd>0.0 <small>%</small></dd></div>
       <div class="v-green"><dt>prediction error</dt><dd>0.000 <small>m</small></dd></div>
-      <div><dt>browser core</dt><dd>38 <small>KB wasm</small></dd></div>
+      <div><dt>browser core</dt><dd>39 <small>KB wasm</small></dd></div>
     </dl>
     <p class="readout-note">Measured on the sidecar's own status line: 7 cars, 6 of them AI drivers. The zero holds across a ~90 ms round trip to Railway too.</p>
   </header>
@@ -681,7 +681,7 @@ kbd {
           <h2>The module becomes a mailbox with a schema.</h2>
           <p>
             Strip the simulation out and what is left is small enough to describe in three words.
-            The module in this demo is 583 lines of Rust and contains no integrator, no collision
+            The module in this demo is 601 lines of Rust and contains no integrator, no collision
             code and not even a track. It is:
           </p>
           <ul class="notes">
@@ -727,7 +727,7 @@ kbd {
 
               <!-- browser contents -->
               <text class="svg-t" x="44" y="92" fill="#38e8ff">physics.wasm</text>
-              <text class="svg-s" x="44" y="110">cdylib · 38 KB · 0 imports</text>
+              <text class="svg-s" x="44" y="110">cdylib · 39 KB · 0 imports</text>
               <line x1="44" y1="128" x2="236" y2="128" stroke="rgba(120,170,220,0.16)" stroke-width="1"/>
               <text class="svg-s" x="44" y="152" fill="#dbe6f5">predict every tick</text>
               <text class="svg-s" x="44" y="172" fill="#dbe6f5">rewind + replay on error</text>
@@ -797,9 +797,14 @@ kbd {
         <div class="code">
           <header><span>module/src/lib.rs</span><em>the entire trust boundary</em></header>
 <pre><span class="c">/// Claim the right to publish authoritative state. First caller wins; a second
-/// sidecar can only take over once the first has disconnected.</span>
+/// sidecar can only take over once the first has disconnected.
+///
+/// `physics_fingerprint` is what the incoming authority's simulation computes.
+/// The module does not check it -- it has no physics to check it against, which
+/// is the entire point -- it just publishes it, so every client can check its
+/// own copy against the one now deciding the race.</span>
 <span class="k">#[reducer]</span>
-<span class="k">pub fn</span> <span class="fn-db">claim_authority</span>(ctx: &amp;ReducerContext) -&gt; Result&lt;(), String&gt; {
+<span class="k">pub fn</span> <span class="fn-db">claim_authority</span>(ctx: &amp;ReducerContext, physics_fingerprint: u32) -&gt; Result&lt;(), String&gt; {
     <span class="k">let mut</span> cfg = config(ctx);
     <span class="k">match</span> cfg.sidecar {
         Some(existing) <span class="k">if</span> existing != ctx.sender() &amp;&amp; cfg.sidecar_online =&gt; {
@@ -809,6 +814,7 @@ kbd {
     }
     cfg.sidecar = Some(ctx.sender());
     cfg.sidecar_online = <span class="k">true</span>;
+    cfg.physics_fingerprint = physics_fingerprint;
     ctx.db.config().id().update(cfg);
     Ok(())
 }
@@ -1192,12 +1198,65 @@ kbd {
         </div>
 
         <div class="prose">
+          <h3>Same source is a build-time fact. Deploys are not.</h3>
+          <p>
+            That check proves something about the machine that built the two halves. It says nothing about
+            the pair actually talking to each other. The sidecar ships to a container and the
+            <code>physics.wasm</code> ships to a CDN, and nothing makes those two things happen together —
+            a cached bundle, a rolled-back service, a deploy that only half succeeded.
+          </p>
+          <p>
+            When they diverge, nothing errors. The client predicts with the physics it has, the authority
+            decides with the physics it has, and every corner ends in a correction that looks exactly like
+            packet loss. It is the worst failure mode this architecture has: silent, and it points at the
+            network.
+          </p>
+          <p>
+            So each side scores itself at startup. Not a version string — that records what someone
+            remembered to bump. A 240-tick scripted race, hashed down to one <code>u32</code> from the raw
+            bits it ends on. Two builds match if and only if they agree on the arithmetic: a refactor that
+            changes nothing observable still matches, and moving one constant does not. The sidecar hands
+            its number to <code>claim_authority</code>, the module publishes it in <code>config</code>
+            without opinion, and the browser compares it against its own.
+          </p>
+        </div>
+
+        <div class="code">
+          <header><span>physics/src/fingerprint.rs</span><em>what this build computes, as one number</em></header>
+<pre><span class="k">pub fn</span> <span class="fn-web">fingerprint</span>() -&gt; u32 {
+    <span class="k">let mut</span> w = World::new();
+    w.spawn(0, 0);
+    w.spawn(1, 3);
+    <span class="k">for</span> tick <span class="k">in</span> 0..TICKS {
+        w.inputs[0] = scripted(tick);
+        w.inputs[1] = scripted(tick + 511);
+        w.step((1 &lt;&lt; CARS) - 1);
+    }
+    hash(&amp;w)  <span class="c">// shape constants, then every f32 bit the race ended on</span>
+}</pre>
+        </div>
+
+        <div class="prose">
+          <p>
+            The browser scores itself inside <code>phys_init</code>, where the module is still allowed to
+            allocate — doing it lazily would grow linear memory and detach every <code>Float32Array</code>
+            mapped over the old buffer. A mismatch turns the authority readout red and says so in the
+            console, naming both numbers, because &ldquo;your prediction is wrong&rdquo; is not an actionable
+            thing to tell someone and &ldquo;redeploy these two together&rdquo; is.
+          </p>
+          <p>
+            The same number is the first row <code>verify-determinism.mjs</code> diffs, so the check that
+            guards the deploy is itself verified by the run that verifies the physics underneath it.
+          </p>
+        </div>
+
+        <div class="prose">
           <h3>Getting state across the boundary for free</h3>
           <p>
             <code>CarState</code> is <code>#[repr(C)]</code> and entirely <code>f32</code> — 24 of them —
             so the browser maps it with a single <code>Float32Array</code> over wasm linear memory and reads
             and writes the simulation in place, with no serialization on the hot path. The whole core is a
-            38 KB <code>.wasm</code> with zero imports: no wasm-bindgen, no wasm-pack, no build plugin.
+            39 KB <code>.wasm</code> with zero imports: no wasm-bindgen, no wasm-pack, no build plugin.
             All allocation happens inside <code>phys_init</code>, so nothing later grows memory and detaches
             the views.
           </p>
@@ -1248,7 +1307,7 @@ kbd {
       <section id="size">
         <div class="kicker"><span>The size of it</span><span class="lane lane-sidecar">server</span></div>
         <div class="prose">
-          <h2>994 lines is the whole authority.</h2>
+          <h2>1008 lines is the whole authority.</h2>
           <p>
             The other cost worth quoting is how much of this you have to write. Everything
             that makes the server the server — the schema, the identity check, the tick
@@ -1263,21 +1322,21 @@ kbd {
               <tr><th scope="col">File</th><th scope="col">Code</th><th scope="col">What is in it</th></tr>
             </thead>
             <tbody>
-              <tr><th scope="row">module/src/lib.rs</th><td class="num">465</td><td>tables, the inbox, the registry, the outbox, the identity check</td></tr>
-              <tr><th scope="row">sidecar/src/authority.rs</th><td class="num">303</td><td>one tick: sync the grid, schedule inputs, simulate, publish</td></tr>
-              <tr><th scope="row">sidecar/src/main.rs</th><td class="num">226</td><td>connect, subscribe, claim, and hold 60 Hz</td></tr>
-              <tr class="sum srv"><th scope="row">the authority</th><td class="num">994</td><td>everything that makes the server the server</td></tr>
-              <tr><th scope="row">web/src/sim.ts</th><td class="num">337</td><td>predict, rewind, replay, smooth</td></tr>
-              <tr><th scope="row">web/src/net.ts</th><td class="num">317</td><td>subscriptions, clock estimate, entity interpolation</td></tr>
+              <tr><th scope="row">module/src/lib.rs</th><td class="num">469</td><td>tables, the inbox, the registry, the outbox, the identity check</td></tr>
+              <tr><th scope="row">sidecar/src/authority.rs</th><td class="num">305</td><td>one tick: sync the grid, schedule inputs, simulate, publish</td></tr>
+              <tr><th scope="row">sidecar/src/main.rs</th><td class="num">234</td><td>connect, subscribe, claim, and hold 60 Hz</td></tr>
+              <tr class="sum srv"><th scope="row">the authority</th><td class="num">1008</td><td>everything that makes the server the server</td></tr>
+              <tr><th scope="row">web/src/sim.ts</th><td class="num">340</td><td>predict, rewind, replay, smooth</td></tr>
+              <tr><th scope="row">web/src/net.ts</th><td class="num">457</td><td>subscriptions, clock estimate, entity interpolation, reconnection</td></tr>
               <tr><th scope="row">web/src/main.ts</th><td class="num">12</td><td>the clock steering that holds the lead</td></tr>
-              <tr class="sum cli"><th scope="row">the netcode</th><td class="num">666</td><td>everything that hides the round trip</td></tr>
+              <tr class="sum cli"><th scope="row">the netcode</th><td class="num">809</td><td>everything that hides the round trip</td></tr>
             </tbody>
           </table>
         </div>
 
         <div class="prose">
           <p>
-            For scale, <code>physics/src</code> is <strong>1609</strong> lines. The simulation
+            For scale, <code>physics/src</code> is <strong>1728</strong> lines. The simulation
             is larger than everything that makes it authoritative — and it is the part you
             would have to write wherever you chose to run it. <code>spacetime generate</code>
             emits another <strong>3100</strong> across 42 files that nobody reads.
@@ -1285,7 +1344,7 @@ kbd {
         </div>
 
         <p class="pull">
-          Narrow it to the trust model itself and it is 104 lines.<br>A quarter of those are
+          Narrow it to the trust model itself and it is 105 lines.<br>A quarter of those are
           one reducer copying a struct field by field.
         </p>
 
@@ -1297,7 +1356,7 @@ kbd {
             being the <code>StateUpdate</code> to <code>CarState</code> copy. Those five are
             the whole mechanism: the database no longer runs the physics, but it is still
             the only thing that can say where a car is. And because the security of the
-            arrangement rests on 104 lines rather than on a codebase, you can read all of
+            arrangement rests on 105 lines rather than on a codebase, you can read all of
             it before deciding to trust it.
           </p>
         </div>
@@ -1321,6 +1380,7 @@ kbd {
             <li><b>Batch the writes</b> One reducer call carrying every changed entity, at a rate below your compute rate. Here that is 20 Hz snapshots against a 60 Hz simulation — a third of the transactions for the same fidelity.</li>
             <li><b>Publish enough to resume from</b> If the outbox is a complete description of your computation's state, a restart is a hiccup instead of a reset. Check that claim explicitly.</li>
             <li><b>Decide whether clients predict</b> Only if input-to-pixel latency matters. If it does, the same source has to run on both sides, which makes determinism a hard requirement and a thing to test in CI.</li>
+            <li><b>Have both sides prove they agree</b> If clients predict, the two halves deploy separately and will eventually be deployed apart. Score each build by what it computes — a fixed scripted run, hashed — publish the authority's number, and have clients check their own. Otherwise a stale bundle is indistinguishable from a bad network.</li>
           </ol>
         </div>
 
@@ -1334,7 +1394,7 @@ kbd {
               <tr><th scope="row">simulation</th><td class="num">6.1 µs / tick</td><td>7 cars, 6 of them AI drivers, on a 16 667 µs budget — 0.0 %</td></tr>
               <tr><th scope="row">transactions</th><td class="num">20 / s</td><td>one <code>push_states</code> per 3 ticks, all cars in one call</td></tr>
               <tr><th scope="row">client uplink</th><td class="num">30 / s</td><td>one <code>set_input</code> row, overwritten</td></tr>
-              <tr><th scope="row">browser core</th><td class="num">38 KB</td><td>wasm with zero imports; 10 000 ticks in 10 ms in Node</td></tr>
+              <tr><th scope="row">browser core</th><td class="num">39 KB</td><td>wasm with zero imports; 10 000 ticks in 10 ms in Node</td></tr>
               <tr><th scope="row">rollback</th><td class="num">~20 µs</td><td>20 replayed ticks — affordable on every snapshot</td></tr>
               <tr><th scope="row">prediction error</th><td class="num">0.000 m</td><td>local link, and across a ~90 ms round trip to <code>us-east4</code></td></tr>
             </tbody>

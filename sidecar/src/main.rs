@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let me = identity.lock().unwrap().expect("identity after connect");
     check_config(&conn)?;
 
-    conn.reducers.claim_authority()?;
+    conn.reducers.claim_authority(physics::fingerprint())?;
     let mut sim = Authority::new(me);
 
     // Resume the tick counter where the last authority left off. The module
@@ -243,6 +243,18 @@ fn check_config(conn: &DbConnection) -> Result<(), Box<dyn std::error::Error>> {
             physics::TICK_HZ
         )
         .into());
+    }
+    // Not fatal, and not the sidecar's problem to fix -- it is the authority,
+    // so whatever it computes is by definition correct. Worth saying out loud
+    // though: it means the clients now have a fingerprint to disagree with, and
+    // any of them still serving the old `physics.wasm` is about to.
+    let mine = physics::fingerprint();
+    if cfg.physics_fingerprint != 0 && cfg.physics_fingerprint != mine {
+        println!(
+            "physics fingerprint {mine:#010x} replaces {:#010x}; clients on the old \
+             physics.wasm will mispredict until they are redeployed too",
+            cfg.physics_fingerprint
+        );
     }
     Ok(())
 }

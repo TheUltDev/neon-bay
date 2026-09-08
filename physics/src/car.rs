@@ -57,6 +57,20 @@ pub const DOWNFORCE: f32 = 1.55;
 pub const MAX_STEER: f32 = 0.58;
 const STEER_RATE: f32 = 5.0;
 const YAW_DAMP: f32 = 620.0;
+/// Rear slip angle, radians, past which a slide counts as a spin rather than
+/// as cornering. Below it nothing changes: a drift is still a drift.
+const SPIN_SLIP: f32 = 0.80;
+/// Extra yaw damping once the car is fully sideways, as a multiple of
+/// [`YAW_DAMP`].
+///
+/// A linear tire model runs out of restoring couple exactly when it is needed
+/// most: past about 45 degrees both axles are pinned near the same slip angle,
+/// the difference between them is what turns the car back straight, and it
+/// goes to zero. Real tires are scrubbing enormously there. This stands in for
+/// that, and is what keeps a provoked spin to a half turn that washes the
+/// speed off rather than a 720 that leaves you pointing backwards, still doing
+/// 80 km/h, with the camera having gone round twice.
+const SPIN_DAMP: f32 = 3.0;
 
 /// Gear ratios purely for the tachometer -- they do not affect the physics.
 const GEAR_TOP: [f32; 6] = [12.0, 22.0, 33.0, 45.0, 57.0, 90.0];
@@ -146,6 +160,16 @@ fn nan_to_zero(v: f32) -> f32 {
 }
 
 impl CarState {
+    /// The record as the flat block of `f32` it is laid out as -- the same view
+    /// the browser takes over wasm memory, and what the fingerprint hashes.
+    #[inline]
+    pub fn as_floats(&self) -> &[f32; CAR_FLOATS] {
+        // SAFETY: `#[repr(C)]` with `CAR_FLOATS` fields, every one an `f32`.
+        // `layout_matches_the_wasm_bridge_contract` asserts exactly that, and
+        // the client would be reading garbage if it ever stopped holding.
+        unsafe { &*(self as *const CarState as *const [f32; CAR_FLOATS]) }
+    }
+
     #[inline]
     pub fn pos(&self) -> V2 {
         V2::new(self.x, self.y)
@@ -233,6 +257,10 @@ pub fn integrate(car: &mut CarState, input: &CarInput, h: f32) {
     // --- slip angles ------------------------------------------------------
     let alpha_f = atan2(w + LF * car.omega, ud) - car.steer * dir;
     let alpha_r = atan2(w - LR * car.omega, ud);
+    // 0 while the car is merely cornering or drifting, ramping to 1 once the
+    // rear has let go far enough that this is a spin. Only [`SPIN_DAMP`] reads
+    // it; the tire forces themselves are untouched.
+    let spin = clamp((abs(alpha_r) - SPIN_SLIP) * 2.0, 0.0, 1.0);
 
     // --- grip budget -------------------------------------------------------
     let cap_f = GRIP_F * fz_f;
@@ -265,8 +293,16 @@ pub fn integrate(car: &mut CarState, input: &CarInput, h: f32) {
     let mut fx_r = drive + coast + braking * (1.0 - bias_f);
 
     // Lateral demand from the tire model, before the friction limit.
-    let fy_f = -C_ALPHA_F * alpha_f * dir * lat_fade;
-    let mut fy_r = -C_ALPHA_R * alpha_r * dir * lat_fade;
+    //
+    // No `dir` here, deliberately. Rubber resists the sideways slide of the
+    // contact patch whichever way the car happens to be travelling, and `ud`
+    // has already thrown away the sign of `u` -- so folding `dir` back in
+    // reverses the lateral force the moment a spin carries the nose past
+    // ninety degrees, at which point the tires start *driving* the slide
+    // instead of fighting it. That is the whole 720. `dir` still belongs on
+    // the steer term above, where the geometry really does invert in reverse.
+    let fy_f = -C_ALPHA_F * alpha_f * lat_fade;
+    let mut fy_r = -C_ALPHA_R * alpha_r * lat_fade;
 
     if inp.handbrake > 0.5 {
         // Locked rear wheels: most of the budget goes into scrubbing off speed
@@ -294,7 +330,8 @@ pub fn integrate(car: &mut CarState, input: &CarInput, h: f32) {
     let (sn, cs) = crate::math::sin_cos(car.steer);
     let fx_body = fx_r + fx_f * cs - fy_f * sn + resist;
     let fy_body = fy_r + fy_f * cs + fx_f * sn;
-    let mz = LF * (fy_f * cs + fx_f * sn) - LR * fy_r - YAW_DAMP * car.omega;
+    let mz =
+        LF * (fy_f * cs + fx_f * sn) - LR * fy_r - YAW_DAMP * (1.0 + SPIN_DAMP * spin) * car.omega;
 
     // No `omega x v` transport terms here: velocity is *stored* in world space
     // and re-projected into the body frame every substep, so the rotation of the

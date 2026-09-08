@@ -15,6 +15,9 @@ const LEAD_MARGIN = 2;
 const INTERP_TICKS = 4.5;
 /** Inputs per second sent upstream. */
 const INPUT_HZ = 30;
+/** Instrument panel repaints per second. It is telemetry, not a mirror, and
+ *  every repaint is a layout pass. */
+const HUD_HZ = 30;
 
 const PALETTE = [0x38e8ff, 0xff4d9d, 0xffc857, 0x5ef2a8, 0xc77dff, 0xff8c42, 0x60a5fa, 0xf472b6];
 
@@ -125,11 +128,37 @@ async function boot() {
   net.onCarsChanged = () => {
     sim.setLocalSlot(net.mySlot);
     refreshActiveMask(sim, net);
-    // Losing the car mid-session (a disconnect race, or the grid being reset)
-    // should not strand the player staring at a track they cannot drive on.
-    if (joined && net.myCarId === 0 && rejoinAt === 0) {
-      rejoinAt = performance.now() + 600;
+  };
+  net.onStatus = (msg) => {
+    $('g-status').textContent = msg;
+    if (joined) hud.toast(msg, 2400);
+  };
+
+  /**
+   * Put the player back on the grid if they are not on it.
+   *
+   * The module reaps a car when its owner's socket closes, so surviving a
+   * reconnect means asking for a new one. Asking repeatedly, at that: a join
+   * sent the instant the new connection lands can arrive before the module has
+   * finished tearing the old one down, in which case it is a no-op and the car
+   * is reaped a moment later anyway.
+   */
+  const ensureCar = (now: number) => {
+    if (!joined || !net.connected || net.myCarId !== 0) {
+      rejoinAt = now + 600;
+      return;
     }
+    if (now < rejoinAt) return;
+    rejoinAt = now + 2000;
+    net.join(lastName, chosenColor).catch(() => {});
+  };
+  net.onReconnect = () => {
+    hud.toast('reconnected');
+    // Do not wait for the next frame: a tab in the background is not getting
+    // one, and coming back to a race you have been dropped out of is the exact
+    // thing this is here to prevent.
+    rejoinAt = 0;
+    ensureCar(performance.now());
   };
 
   // --- join flow -----------------------------------------------------------
@@ -186,6 +215,29 @@ async function boot() {
     $<HTMLInputElement>('t-rotate').checked = renderer.rotateCamera;
   });
 
+  // The authority publishes what its physics computes; this one knows what its
+  // own does. They are built from the same source, so they agree unless the two
+  // halves were deployed apart -- which otherwise shows up only as prediction
+  // error, and reads as a network problem rather than a stale bundle.
+  let warnedMismatch = false;
+  const checkPhysics = () => {
+    if (warnedMismatch || !physicsMismatch(sim, net)) return;
+    warnedMismatch = true;
+    const mine = hex(sim.fingerprint);
+    const theirs = hex(net.physicsFingerprint);
+    console.error(
+      `physics mismatch: this client computes ${mine}, the authority computes ${theirs}. ` +
+        'They were built from different sources, so prediction will not hold and every ' +
+        'corner will end in a correction. Redeploy physics.wasm and the sidecar together.',
+    );
+    hud.toast('physics mismatch — see console', 6000);
+    $('g-status').innerHTML =
+      `<b style="color:var(--red)">physics mismatch</b><br>client ${mine} vs authority ${theirs}. ` +
+      'Prediction is off until both are redeployed from the same source.';
+  };
+  net.onConfigChanged = checkPhysics;
+  checkPhysics();
+
   // Handy from the devtools console when poking at the netcode:
   //   __neon.sim.stats, __neon.net.rttMs, __neon.sim.cheat(30)
   (window as unknown as Record<string, unknown>).__neon = { sim, net, renderer, hud, controls, audio };
@@ -197,18 +249,16 @@ async function boot() {
   let correctionWindow = performance.now();
   let correctionsAtWindow = 0;
   let correctionsPerSec = 0;
+  let hudAt = 0;
+  const measureFps = frameCounter();
 
   function frame(now: number) {
     const dt = Math.min((now - last) / 1000, 0.25);
     last = now;
 
-    if (rejoinAt !== 0 && now > rejoinAt) {
-      rejoinAt = 0;
-      if (net.myCarId === 0) {
-        net.join(lastName, chosenColor).catch(() => {});
-        hud.toast('rejoining');
-      }
-    }
+    // Losing the car mid-session -- a disconnect race, or the grid being reset
+    // -- should not strand the player staring at a track they cannot drive on.
+    ensureCar(now);
 
     // ---- clock sync -------------------------------------------------------
     // Run far enough ahead that an input for tick T reaches the sidecar before
@@ -288,12 +338,17 @@ async function boot() {
     renderer.drawMinimap($<HTMLCanvasElement>('minimap'), sim, cars);
 
     // ---- telemetry --------------------------------------------------------
+    // Every frame, not every HUD repaint: this is counting them.
+    const fps = measureFps(now);
     if (now - correctionWindow > 1000) {
       correctionsPerSec = ((sim.stats.corrections - correctionsAtWindow) * 1000) / (now - correctionWindow);
       correctionsAtWindow = sim.stats.corrections;
       correctionWindow = now;
     }
-    hud.update(buildHudState(sim, net, correctionsPerSec, serverNow));
+    if (now - hudAt >= 1000 / HUD_HZ) {
+      hudAt = now;
+      hud.update(buildHudState(sim, net, correctionsPerSec, serverNow, fps));
+    }
 
     if (audio.running && sim.localSlot >= 0) {
       audio.engine(
@@ -388,6 +443,19 @@ function leader(cars: DrawCar[]): DrawCar | null {
   return best;
 }
 
+/**
+ * Whether this client and the authority are running the same simulation.
+ *
+ * They have to be, or none of the rest of this means anything: the prediction
+ * loop assumes that stepping the same inputs here and there lands on the same
+ * bits, and if it does not, every corner ends in a correction that looks like
+ * packet loss and is really a stale `physics.wasm`. Zero means no sidecar has
+ * claimed yet, so there is nothing to compare against.
+ */
+function physicsMismatch(sim: Sim, net: Net): boolean {
+  return net.physicsFingerprint !== 0 && net.physicsFingerprint !== sim.fingerprint;
+}
+
 /** Latest authoritative pose of the local car, for the ghost overlay. */
 function ghostPose(net: Net) {
   const buf = net.buffers.get(net.myCarId);
@@ -424,6 +492,7 @@ function buildHudState(
   net: Net,
   correctionsPerSec: number,
   serverNow: number,
+  fps: number,
 ): HudState {
   const slot = sim.localSlot;
   const has = slot >= 0;
@@ -439,7 +508,14 @@ function buildHudState(
   if (mineAt >= 10) top.push({ ...board[mineAt], rank: mineAt + 1, cut: true });
 
   return {
-    authority: !net.connected ? 'connecting' : net.sidecarOnline ? 'online' : 'offline',
+    authority: !net.connected
+      ? 'connecting'
+      : physicsMismatch(sim, net)
+        ? 'mismatch'
+        : net.sidecarOnline
+          ? 'online'
+          : 'offline',
+    fps,
     serverTick: Math.round(serverNow),
     clientTick: sim.localTick,
     lead: has ? sim.localTick - Math.round(serverNow) : 0,
@@ -464,6 +540,8 @@ function buildHudState(
     leaderboard: top,
   };
 }
+
+const hex = (v: number) => `0x${(v >>> 0).toString(16).padStart(8, '0')}`;
 
 /** Wires a range input to its readout. Returns a setter for driving it in code. */
 function bindSlider(
@@ -505,9 +583,32 @@ function buildColorPicker(initial: number, onPick: (c: number) => void) {
   });
 }
 
+/**
+ * Rendered frames per second, averaged over half-second windows.
+ *
+ * A shorter window than the corrections counter uses, deliberately: this is the
+ * number you watch while changing something, so it has to react. Call it once
+ * per frame -- it is counting the calls.
+ */
+function frameCounter(): (now: number) => number {
+  let windowStart = performance.now();
+  let frames = 0;
+  let fps = 0;
+  return (now) => {
+    frames++;
+    if (now - windowStart >= 500) {
+      fps = (frames * 1000) / (now - windowStart);
+      frames = 0;
+      windowStart = now;
+    }
+    return fps;
+  };
+}
+
 /** Offline fallback: still show the circuit so the page is not a blank void. */
 function startRenderOnly(renderer: Renderer, sim: Sim, hud: Hud) {
   let last = performance.now();
+  const measureFps = frameCounter();
   const loop = (now: number) => {
     const dt = Math.min((now - last) / 1000, 0.1);
     last = now;
@@ -516,7 +617,9 @@ function startRenderOnly(renderer: Renderer, sim: Sim, hud: Hud) {
     renderer.camZoom = 6;
     renderer.draw([], null, dt, 0);
     renderer.drawMinimap($<HTMLCanvasElement>('minimap'), sim, []);
-    hud.update(offlineHud());
+    // Nothing else on this page has a number in it, and the renderer is the
+    // only thing still running -- so the frame rate is worth showing even here.
+    hud.update({ ...offlineHud(), fps: measureFps(now) });
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);
@@ -525,6 +628,7 @@ function startRenderOnly(renderer: Renderer, sim: Sim, hud: Hud) {
 function offlineHud(): HudState {
   return {
     authority: 'offline',
+    fps: 0,
     serverTick: 0,
     clientTick: 0,
     lead: 0,

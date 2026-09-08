@@ -76,6 +76,8 @@ pub struct Authority {
     identity: Identity,
     has_authority: bool,
     last_claim: Instant,
+    /// Cached: scoring it runs a scripted race, and re-claiming is a loop.
+    fingerprint: u32,
     // --- telemetry ---
     pub sim_time: Duration,
     pub ticks_this_second: u32,
@@ -93,6 +95,7 @@ impl Authority {
             identity,
             has_authority: false,
             last_claim: Instant::now() - Duration::from_secs(5),
+            fingerprint: physics::fingerprint(),
             sim_time: Duration::ZERO,
             ticks_this_second: 0,
             snapshots_this_second: 0,
@@ -137,7 +140,7 @@ impl Authority {
         self.has_authority = false;
         if self.last_claim.elapsed() > Duration::from_secs(1) {
             self.last_claim = Instant::now();
-            let _ = conn.reducers.claim_authority();
+            let _ = conn.reducers.claim_authority(self.fingerprint);
         }
     }
 

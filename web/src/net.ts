@@ -46,6 +46,20 @@ export interface NetSim {
 
 const SNAPSHOT_BUFFER = 40;
 
+/** Reconnect backoff: first retry, and the ceiling it doubles up to. */
+const RECONNECT_BASE_MS = 700;
+const RECONNECT_MAX_MS = 8000;
+/** How often the connection is checked for the failure modes in `watch`. */
+const WATCHDOG_MS = 2000;
+/**
+ * Silence from an authority that still claims to be running for longer than
+ * this is a dead socket, not a quiet moment. The sidecar publishes at 20 Hz,
+ * and had it gone away the module would have said so on this same connection.
+ */
+const STALL_MS = 5000;
+/** A dial that has neither connected nor failed by now has hung. */
+const DIAL_TIMEOUT_MS = 15000;
+
 export class Net {
   conn!: DbConnection;
   identity: Identity | null = null;
@@ -72,6 +86,9 @@ export class Net {
   sidecarOnline = false;
   tickHz = 60;
   snapshotHz = 20;
+  /** Fingerprint of the physics the current authority is running, or 0 before
+   *  any sidecar has claimed. */
+  physicsFingerprint = 0;
 
   // --- measured link quality ---
   rttMs = 0;
@@ -84,45 +101,211 @@ export class Net {
   netSim: NetSim = { latencyMs: 0, jitterMs: 0, lossPct: 0 };
   droppedInputs = 0;
 
+  /** Scratch for `sampleRemote`. A full grid sampled on every fixed step is a
+   *  couple of hundred short-lived typed arrays a frame, which Firefox collects
+   *  as visible hitches; every caller reads the result out before asking for
+   *  the next one, so one buffer does. */
+  private sampleOut = new Float32Array(24);
+  private recordsCache: LapRecordRow[] = [];
+  private recordsAt = 0;
+
   onLocalSnapshot: ((s: Snapshot) => void) | null = null;
   onCarsChanged: (() => void) | null = null;
   onStatus: ((msg: string) => void) | null = null;
+  /** The `config` row landed or changed -- which is when the authority's
+   *  physics fingerprint becomes known. */
+  onConfigChanged: (() => void) | null = null;
+  /** Fired once a *re*-connection is subscribed and usable again. The first
+   *  connection resolves `connect()` instead. */
+  onReconnect: (() => void) | null = null;
+
+  // --- reconnection ---
+  private uri = '';
+  private dbName = '';
+  /** Bumped once per dial. Callbacks arriving from a superseded socket carry a
+   *  stale one and are ignored, so a late `close` cannot tear down the
+   *  connection that replaced it. */
+  private epoch = 0;
+  private dialing = false;
+  private dialingSince = 0;
+  private retryTimer = 0;
+  private retryDelay = RECONNECT_BASE_MS;
 
   async connect(uri: string, dbName: string): Promise<void> {
-    const tokenKey = `stdb-sidecar-token:${dbName}`;
-    const saved = localStorage.getItem(tokenKey) ?? undefined;
+    this.uri = uri;
+    this.dbName = dbName;
+    await this.open(true);
+    this.watch();
+  }
 
-    await new Promise<void>((resolve, reject) => {
+  /**
+   * Dial the database.
+   *
+   * The first attempt rejects if it fails, so the page can fall back to the
+   * offline view. Every attempt after that is the reconnect loop and never
+   * rejects: it queues another try and returns.
+   */
+  private open(initial: boolean): Promise<void> {
+    const tokenKey = `stdb-sidecar-token:${this.dbName}`;
+    const saved = localStorage.getItem(tokenKey) ?? undefined;
+    const epoch = ++this.epoch;
+    this.dialing = true;
+    this.dialingSince = performance.now();
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const succeed = () => {
+        if (settled) return;
+        settled = true;
+        this.dialing = false;
+        resolve();
+      };
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        this.dialing = false;
+        if (initial) {
+          reject(err);
+        } else {
+          this.scheduleReconnect();
+          resolve();
+        }
+      };
+
       const builder = DbConnection.builder()
-        .withUri(uri)
-        .withDatabaseName(dbName)
+        .withUri(this.uri)
+        .withDatabaseName(this.dbName)
         .withToken(saved)
         .onConnect((conn, identity, token) => {
+          if (epoch !== this.epoch) return;
           this.conn = conn;
           this.identity = identity;
           this.connected = true;
+          this.retryDelay = RECONNECT_BASE_MS;
           try {
             localStorage.setItem(tokenKey, token);
           } catch {
             /* private browsing; a fresh identity per session is fine */
           }
-          this.subscribe(resolve);
+          this.subscribe(conn, epoch, () => {
+            succeed();
+            if (!initial) this.onReconnect?.();
+          });
         })
-        .onConnectError((_ctx, err) => reject(err))
+        .onConnectError((_ctx, err) => {
+          if (epoch !== this.epoch) return;
+          fail(err);
+        })
         .onDisconnect((_ctx, err) => {
-          this.connected = false;
-          this.onStatus?.(err ? `disconnected: ${err.message}` : 'disconnected');
+          if (epoch !== this.epoch) return;
+          this.dropped(err ? `disconnected: ${err.message}` : 'disconnected');
+          // A socket that dies before its subscription applied still has to
+          // settle this promise, or the retry chain ends here.
+          fail(err ?? new Error('disconnected'));
         });
       this.conn = builder.build();
     });
   }
 
-  private subscribe(ready: () => void) {
-    const db = this.conn.db;
+  /** Forget the session that just ended, and queue a redial. */
+  private dropped(why: string) {
+    if (!this.connected && !this.subscribed) return; // already handled
+    this.connected = false;
+    this.subscribed = false;
+    this.cars.clear();
+    this.buffers.clear();
+    this.myCarId = 0;
+    this.mySlot = -1;
+    this.sentAt.clear();
+    this.clockLocked = false;
+    this.lastSnapTick = 0;
+    this.lastSnapAt = 0;
+    this.sidecarOnline = false;
+    this.snapshotsPerSec = 0;
+    this.onStatus?.(why);
+    this.onCarsChanged?.();
+    this.scheduleReconnect();
+  }
 
-    db.car.onInsert((_ctx, row) => this.upsertCar(row));
-    db.car.onUpdate((_ctx, _old, row) => this.upsertCar(row));
+  private scheduleReconnect() {
+    if (this.retryTimer !== 0 || this.dialing) return;
+    const delay = this.retryDelay;
+    this.retryDelay = Math.min(this.retryDelay * 2, RECONNECT_MAX_MS);
+    this.retryTimer = window.setTimeout(() => {
+      this.retryTimer = 0;
+      void this.open(false);
+    }, delay);
+  }
+
+  /**
+   * Two ways a session dies without the page being told, and they look
+   * identical from the driver's seat -- every other car stops dead and never
+   * moves again until a reload:
+   *
+   * * the socket was torn down while the tab was frozen or the machine asleep,
+   *   and no `close` event was ever delivered;
+   * * the socket is nominally open but has stopped carrying anything.
+   *
+   * Neither one fires `onDisconnect`, so both are polled for here.
+   */
+  private watch() {
+    const check = () => {
+      if (this.dialing) {
+        // Everything below waits for a dial in flight to finish, so one that
+        // never does -- a socket that opens and then goes quiet before its
+        // subscription applies -- would wedge the retry loop for good.
+        if (performance.now() - this.dialingSince < DIAL_TIMEOUT_MS) return;
+        this.dialing = false;
+        this.epoch++; // orphan the stuck attempt: its callbacks are stale now
+        this.retryDelay = RECONNECT_BASE_MS;
+        this.dropped('connection timed out — reconnecting');
+        this.scheduleReconnect(); // in case `dropped` had nothing to tear down
+        try {
+          this.conn.disconnect();
+        } catch {
+          /* it never finished opening; there may be nothing to close */
+        }
+        return;
+      }
+      if (this.retryTimer !== 0) return;
+      if (!this.connected) {
+        this.scheduleReconnect();
+        return;
+      }
+      const zombie = !this.conn.isActive || this.conn.isSocketClosed;
+      const stalled =
+        this.subscribed &&
+        this.sidecarOnline &&
+        this.lastSnapAt > 0 &&
+        performance.now() - this.lastSnapAt > STALL_MS;
+      if (!zombie && !stalled) return;
+      // Redial straight away: this link has already been down a while, it did
+      // not just fail this instant.
+      this.retryDelay = RECONNECT_BASE_MS;
+      this.dropped(zombie ? 'connection lost — reconnecting' : 'stream stalled — reconnecting');
+      try {
+        this.conn.disconnect();
+      } catch {
+        /* the socket is the thing being complained about; it may already be gone */
+      }
+    };
+    window.setInterval(check, WATCHDOG_MS);
+    // Coming back to the foreground is the likeliest moment to be holding a
+    // socket the OS closed while the tab was away.
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) check();
+    });
+    window.addEventListener('online', check);
+  }
+
+  private subscribe(conn: DbConnection, epoch: number, ready: () => void) {
+    const db = conn.db;
+    const live = () => this.epoch === epoch;
+
+    db.car.onInsert((_ctx, row) => live() && this.upsertCar(row));
+    db.car.onUpdate((_ctx, _old, row) => live() && this.upsertCar(row));
     db.car.onDelete((_ctx, row) => {
+      if (!live()) return;
       this.cars.delete(row.carId);
       this.buffers.delete(row.carId);
       if (row.carId === this.myCarId) {
@@ -132,13 +315,14 @@ export class Net {
       this.onCarsChanged?.();
     });
 
-    db.carState.onInsert((_ctx, row) => this.onState(row));
-    db.carState.onUpdate((_ctx, _old, row) => this.onState(row));
+    db.carState.onInsert((_ctx, row) => live() && this.onState(row));
+    db.carState.onUpdate((_ctx, _old, row) => live() && this.onState(row));
 
-    db.config.onInsert((_ctx, row) => this.onConfig(row));
-    db.config.onUpdate((_ctx, _old, row) => this.onConfig(row));
+    db.config.onInsert((_ctx, row) => live() && this.onConfig(row));
+    db.config.onUpdate((_ctx, _old, row) => live() && this.onConfig(row));
 
     db.player.onUpdate((_ctx: EventContext, _old, row) => {
+      if (!live()) return;
       if (this.identity && row.identity.isEqual(this.identity)) {
         this.myCarId = row.carId;
         const meta = this.cars.get(row.carId);
@@ -147,16 +331,17 @@ export class Net {
       }
     });
 
-    this.conn
+    conn
       .subscriptionBuilder()
       .onApplied(() => {
+        if (!live()) return;
         this.subscribed = true;
-        for (const c of this.conn.db.car.iter()) this.upsertCar(c);
-        for (const s of this.conn.db.carState.iter()) this.onState(s);
-        for (const cfg of this.conn.db.config.iter()) this.onConfig(cfg);
+        for (const c of db.car.iter()) this.upsertCar(c);
+        for (const s of db.carState.iter()) this.onState(s);
+        for (const cfg of db.config.iter()) this.onConfig(cfg);
         ready();
       })
-      .onError(() => this.onStatus?.('subscription failed'))
+      .onError(() => live() && this.onStatus?.('subscription failed'))
       .subscribe([
         'SELECT * FROM config',
         'SELECT * FROM car',
@@ -166,11 +351,19 @@ export class Net {
       ]);
   }
 
-  private onConfig(row: { sidecarOnline: boolean; serverTick: bigint; tickHz: number; snapshotHz: number }) {
+  private onConfig(row: {
+    sidecarOnline: boolean;
+    serverTick: bigint;
+    tickHz: number;
+    snapshotHz: number;
+    physicsFingerprint: number;
+  }) {
     this.sidecarOnline = row.sidecarOnline;
     this.serverTick = Number(row.serverTick);
     this.tickHz = row.tickHz;
     this.snapshotHz = row.snapshotHz;
+    this.physicsFingerprint = row.physicsFingerprint >>> 0;
+    this.onConfigChanged?.();
   }
 
   private upsertCar(row: CarRow) {
@@ -275,14 +468,17 @@ export class Net {
   // ------------------------------------------------------------- commands --
 
   async join(name: string, color: number) {
+    if (!this.connected) throw new Error('not connected');
     await this.conn.reducers.joinRace({ name, color });
   }
 
   async leave() {
+    if (!this.connected) return;
     await this.conn.reducers.leaveRace({});
   }
 
   async respawn() {
+    if (!this.connected) return;
     await this.conn.reducers.requestRespawn({});
   }
 
@@ -359,7 +555,8 @@ export class Net {
     if (atTick >= last.tick) {
       // Ran out of buffer: dead reckon briefly rather than freeze.
       const ahead = Math.min((atTick - last.tick) / 60, 0.25);
-      const out = new Float32Array(last.state);
+      const out = this.sampleOut;
+      out.set(last.state);
       out[F.x] += out[F.vx] * ahead;
       out[F.y] += out[F.vy] * ahead;
       out[F.heading] += out[F.omega] * ahead;
@@ -371,7 +568,7 @@ export class Net {
       const a = buf[i - 1];
       if (atTick >= a.tick && atTick <= b.tick) {
         const t = (atTick - a.tick) / Math.max(1, b.tick - a.tick);
-        return lerpState(a.state, b.state, t);
+        return lerpState(this.sampleOut, a.state, b.state, t);
       }
     }
     return buf[0].state;
@@ -381,9 +578,14 @@ export class Net {
    *  The module keeps the times; colours and "that's me" only exist client-side,
    *  and a name can outlive its car, so both are optional. */
   records(): LapRecordRow[] {
-    if (!this.conn?.db) return [];
+    // Walking the table, joining it against the grid and sorting is not a
+    // per-frame job: a best lap changes a few times a minute at most.
+    const now = performance.now();
+    if (now - this.recordsAt < 250) return this.recordsCache;
+    this.recordsAt = now;
+    if (!this.conn?.db || !this.subscribed) return (this.recordsCache = []);
     const live = new Map([...this.cars.values()].map((c) => [c.name, c]));
-    return [...this.conn.db.lapRecord.iter()]
+    return (this.recordsCache = [...this.conn.db.lapRecord.iter()]
       .map((r) => {
         const car = live.get(r.name);
         return {
@@ -394,7 +596,7 @@ export class Net {
           mine: car?.mine ?? false,
         };
       })
-      .sort((a, b) => a.bestLap - b.bestLap);
+      .sort((a, b) => a.bestLap - b.bestLap));
   }
 }
 
@@ -405,8 +607,8 @@ function shortAngle(a: number, b: number): number {
   return d;
 }
 
-function lerpState(a: Float32Array, b: Float32Array, t: number): Float32Array {
-  const out = new Float32Array(b);
+function lerpState(out: Float32Array, a: Float32Array, b: Float32Array, t: number): Float32Array {
+  out.set(b);
   for (const f of [F.x, F.y, F.vx, F.vy, F.omega, F.steer, F.wheelSpin, F.rpm, F.s, F.lat]) {
     out[f] = a[f] + (b[f] - a[f]) * t;
   }

@@ -91,7 +91,7 @@ powershell -File scripts/dev.ps1 -Bots 6
 
 Then open <http://localhost:5173>, pick a name and color, and drive with
 `WASD`. `Space` is the handbrake, `R` respawns, `G` toggles the server ghost,
-`C` toggles a rotating camera.
+`C` toggles the rotating camera, which starts on.
 
 **Version pinning matters here.** `spacetime generate` emits bindings for the
 CLI's own version, and they have to compile against the SDK this project pins.
@@ -220,6 +220,13 @@ point a deployed page at a server on your desk:
 https://<your-worker>.workers.dev/?uri=http://192.168.1.20:3000
 ```
 
+**Ship the sidecar and `physics.wasm` together.** They are two halves of one
+simulation and they deploy to different places, so it is entirely possible to
+update one and not the other. If you do, the client will say so -- the authority
+readout turns red and reads *physics mismatch* -- rather than leaving you to
+work out why prediction went bad. See
+[Checking it at runtime too](#checking-it-at-runtime-too).
+
 ## What to try
 
 The HUD's **Prediction & reconciliation** panel is the demo. Everything below
@@ -302,9 +309,38 @@ way, and both are handled in `physics/src/math.rs`:
 through both builds and diffs the raw `f32` bits:
 
 ```
-All 10 checkpoints identical, bit for bit.
+ok   native fp   8338134d
+     wasm   fp   8338134d
+...
+All 11 checkpoints identical, bit for bit.
 x86-64 and wasm32 agree, so a healthy client predicts with zero error.
 ```
+
+### Checking it at runtime too
+
+That verifies the two builds on the machine that built them. It says nothing
+about the pair actually talking to each other: the sidecar ships to a container
+and `physics.wasm` ships to a CDN, and nothing makes those happen together. A
+cached bundle, a rolled-back service, a deploy that only half succeeded -- and
+now the client predicts with one physics and the authority decides with another.
+
+Nothing errors when that happens. Every corner just ends in a correction that
+looks exactly like packet loss, which is the worst kind of bug this architecture
+can have: silent, and pointing at the network.
+
+So each side scores itself at startup. Not a version string, which only records
+what someone remembered to bump -- a 240-tick scripted race, hashed down to one
+`u32` from the raw bits it ends on (`physics/src/fingerprint.rs`). Two builds
+match if and only if they agree on the arithmetic: a refactor that changes
+nothing observable still matches, and moving one constant does not.
+
+The sidecar hands its number to `claim_authority`; the module publishes it in
+`config` without an opinion, having no physics of its own to judge it with; the
+browser compares it against what its own wasm computes. On a mismatch the
+authority readout goes red and reads **physics mismatch**, and the console names
+both numbers and says to redeploy the two together. That first `fp` row above is
+the same number, so the check that guards the deploy is verified by the same run
+that verifies the physics underneath it.
 
 ## The car
 
@@ -322,7 +358,7 @@ Tuned against tests rather than vibes (`cargo test -p physics --release`):
 | top speed | 238 km/h |
 | steady-state cornering | 1.6 g, understeer-limited at the edge |
 | circuit | 1424.7 m, 15–20 m wide, 12 checkpoints |
-| bot lap times | 43.6 – 45.5 s, spread by driver skill |
+| bot lap times | 43.1 – 45.1 s, spread by driver skill |
 
 The skidpad test asserts the car *understeers* at the limit. An
 oversteer-limited car is undriveable with a keyboard, and it is a mistake you
@@ -347,7 +383,7 @@ Six microseconds against a 16.7 ms budget. The wasm build runs 10 000 ticks in
 10 ms in Node, so a 20-tick rollback costs about 20 µs, cheap enough that the
 client can afford one on every snapshot without thinking about it.
 
-The whole physics core is a **38 KB** `.wasm` with zero imports: no
+The whole physics core is a **39 KB** `.wasm` with zero imports: no
 wasm-bindgen, no wasm-pack, no build plugin. `CarState` is `#[repr(C)]` and
 entirely `f32`, so the browser maps it with a single `Float32Array` over wasm
 linear memory and reads and writes the simulation in place, with no serialization
@@ -360,28 +396,28 @@ the hand-written files, generated bindings excluded:
 
 | | Code | |
 |---|---|---|
-| `module/src/lib.rs` | 465 | tables, the inbox, the registry, the outbox, the identity check |
-| `sidecar/src/authority.rs` | 303 | one tick: sync the grid, schedule inputs, simulate, publish |
-| `sidecar/src/main.rs` | 226 | connect, subscribe, claim, and hold 60 Hz |
-| **the authority** | **994** | everything that makes the server the server |
-| `web/src/sim.ts` | 337 | predict, rewind, replay, smooth |
-| `web/src/net.ts` | 317 | subscriptions, clock estimate, entity interpolation |
+| `module/src/lib.rs` | 469 | tables, the inbox, the registry, the outbox, the identity check |
+| `sidecar/src/authority.rs` | 305 | one tick: sync the grid, schedule inputs, simulate, publish |
+| `sidecar/src/main.rs` | 234 | connect, subscribe, claim, and hold 60 Hz |
+| **the authority** | **1008** | everything that makes the server the server |
+| `web/src/sim.ts` | 340 | predict, rewind, replay, smooth |
+| `web/src/net.ts` | 457 | subscriptions, clock estimate, entity interpolation, reconnection |
 | `web/src/main.ts` | 12 | the clock steering that holds the lead |
-| **the netcode** | **666** | everything that hides the round trip |
+| **the netcode** | **809** | everything that hides the round trip |
 
 ```bash
 scc module/src/lib.rs sidecar/src/main.rs sidecar/src/authority.rs
 scc web/src/sim.ts web/src/net.ts
 ```
 
-For scale: `physics/src` is **1609** lines. The simulation is larger than
+For scale: `physics/src` is **1728** lines. The simulation is larger than
 everything that makes it authoritative, and it is the part you would have to
 write wherever you chose to run it. `spacetime generate` emits another **3100**
 across 42 files that nobody reads.
 
 Narrow it further and the trust model itself -- `claim_authority`,
 `release_authority`, `require_authority`, `set_input` and `push_states`
-together -- is **104 lines**, a quarter of them `push_states` copying a struct
+together -- is **105 lines**, a quarter of them `push_states` copying a struct
 field by field. The security of the whole arrangement rests on that much code
 rather than on a codebase, so you can read all of it before deciding to trust it.
 
@@ -436,8 +472,10 @@ spacetime sql --server local physics-sidecar "SELECT car_id, tick, x, y, lap FRO
 spacetime logs --server local physics-sidecar
 ```
 
-In the browser console, `__neon` exposes `{ sim, net, renderer, hud, controls }`:
-`__neon.sim.stats`, `__neon.net.rttMs`, `__neon.sim.cheat(30)`.
+In the browser console, `__neon` exposes
+`{ sim, net, renderer, hud, controls, audio }`: `__neon.sim.stats`,
+`__neon.net.rttMs`, `__neon.sim.cheat(30)`, and `__neon.sim.fingerprint`
+against `__neon.net.physicsFingerprint` to see the two physics builds agree.
 
 ## License
 

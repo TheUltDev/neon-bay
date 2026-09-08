@@ -37,6 +37,22 @@ body {
   display: block;
 }
 
+/* Was a full-screen radial gradient blended into the canvas on every frame,
+   which measured as more expensive than drawing the track. It only ever changes
+   with the window, so it belongs to the compositor. The stops mirror what the
+   renderer used to fill: transparent out to 35% of the short side, 55% black by
+   75% of the long one. */
+#vignette {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    circle at 50% 50%,
+    rgba(0, 0, 0, 0) calc(min(100vw, 100vh) * 0.35),
+    rgba(0, 0, 0, 0.55) calc(max(100vw, 100vh) * 0.75)
+  );
+}
+
 /* Layout: three columns over the canvas, hotkey bar on its own row beneath
    them. Column widths and the gap are the only things the breakpoints touch —
    everything inside packs itself, so no panel ever has to move or disappear. */

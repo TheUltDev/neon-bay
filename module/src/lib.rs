@@ -36,6 +36,17 @@ pub struct Config {
     /// Most recent simulation tick the authority has published.
     pub server_tick: u64,
     pub updated_at: Timestamp,
+    /// What the current authority's physics build computes, as one number.
+    /// Clients compare it against their own `physics.wasm` and stop trusting
+    /// their prediction if it differs -- see `physics::fingerprint`.
+    ///
+    /// Last in the struct and carrying a default so that adding it is an
+    /// automatic migration: a live database should not have to be wiped, and
+    /// its leaderboard thrown away, to gain a health check. Zero means no
+    /// sidecar has claimed yet, which clients read as "nothing to compare
+    /// against" rather than as a mismatch.
+    #[default(0)]
+    pub physics_fingerprint: u32,
 }
 
 #[table(accessor = player, public)]
@@ -185,6 +196,7 @@ pub fn init(ctx: &ReducerContext) {
         max_cars: MAX_CARS,
         server_tick: 0,
         updated_at: ctx.timestamp,
+        physics_fingerprint: 0,
     });
     log::info!("physics-sidecar module initialized, {MAX_CARS} car slots");
 }
@@ -237,8 +249,13 @@ pub fn client_disconnected(ctx: &ReducerContext) {
 /// First caller wins. A second sidecar can only take over once the first has
 /// disconnected, which makes a restart seamless but blocks a rogue client from
 /// stealing the simulation out from under a live one.
+///
+/// `physics_fingerprint` is what the incoming authority's simulation computes.
+/// The module does not check it -- it has no physics to check it against, which
+/// is the entire point of the sidecar -- it just publishes it so that every
+/// client can check its own copy against the one now deciding the race.
 #[reducer]
-pub fn claim_authority(ctx: &ReducerContext) -> Result<(), String> {
+pub fn claim_authority(ctx: &ReducerContext, physics_fingerprint: u32) -> Result<(), String> {
     let mut cfg = config(ctx);
     match cfg.sidecar {
         Some(existing) if existing != ctx.sender() && cfg.sidecar_online => {
@@ -248,6 +265,7 @@ pub fn claim_authority(ctx: &ReducerContext) -> Result<(), String> {
     }
     cfg.sidecar = Some(ctx.sender());
     cfg.sidecar_online = true;
+    cfg.physics_fingerprint = physics_fingerprint;
     cfg.updated_at = ctx.timestamp;
     ctx.db.config().id().update(cfg);
     // Bot cars are deliberately left alone. The incoming sidecar adopts them
