@@ -44,7 +44,11 @@ RUN mkdir -p /out \
  && [ -f "$wasm" ] || wasm=module/target/wasm32-unknown-unknown/release/physics_sidecar_module.wasm \
  && cp "$wasm" /out/module.wasm
 
-RUN spacetime generate --lang rust --yes \
+# `--include-private` is what puts the `input` table in these bindings. It is a
+# private table, so the codegen leaves it out of an ordinary client's -- and the
+# sidecar is not an ordinary client: it connects as the database's owner, which
+# is the only identity allowed to read it.
+RUN spacetime generate --lang rust --include-private --yes \
       --bin-path /out/module.wasm \
       --out-dir sidecar/src/module_bindings
 

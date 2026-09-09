@@ -29,6 +29,20 @@ if (-not (Test-Path $sidecar)) {
   Pop-Location
 }
 
+# `input` is a private table, which SpacetimeDB shows to the database's owner
+# and to nobody else. The sidecar is that owner -- the identity that published
+# the module -- so it needs that identity's token. Handed over in the
+# environment rather than on the command line, where it would be visible to
+# anything that can list processes.
+$token = (& spacetime login show --token 2>$null | Select-String 'auth token' |
+  ForEach-Object { ($_ -split ' ')[-1] })
+if (-not $token) {
+  Write-Host 'Could not read an auth token from `spacetime login show --token`.' -ForegroundColor Yellow
+  Write-Host 'The sidecar has to connect as the identity that published the module.' -ForegroundColor Yellow
+  exit 1
+}
+$env:STDB_TOKEN = $token
+
 Write-Host 'Starting the authoritative sidecar...' -ForegroundColor Cyan
 Start-Process -FilePath $sidecar -ArgumentList @('--bots', $Bots, '--db', $Db, '--uri', $Uri) -WorkingDirectory $root
 

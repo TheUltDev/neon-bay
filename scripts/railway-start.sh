@@ -103,8 +103,16 @@ rights back. Delete ${DATA_DIR} -- and only that, the keypair and cli.toml
 beside it are what the next boot needs to stay the same server."
 fi
 
+# The sidecar connects as the identity that owns the database, because `input`
+# is a private table and SpacetimeDB shows one of those to its owner and to
+# nobody else. That identity is the CLI's, and its token is in the config file
+# on the volume -- the same file that lets the next deploy publish at all.
+SIDECAR_TOKEN="$(awk -F'"' '/^spacetimedb_token/ { print $2; exit }' "$CLI_CONFIG")"
+[ -n "$SIDECAR_TOKEN" ] || die "no spacetimedb_token in ${CLI_CONFIG}; the sidecar cannot
+read the input table without it, and the race would never start."
+
 log "sidecar -> ${LOCAL} / ${DB}, ${BOTS} bots"
-sidecar --uri "$LOCAL" --db "$DB" --bots "$BOTS" ${SIDECAR_QUIET:+--quiet} &
+STDB_TOKEN="$SIDECAR_TOKEN" sidecar --uri "$LOCAL" --db "$DB" --bots "$BOTS" ${SIDECAR_QUIET:+--quiet} &
 SIDECAR_PID=$!
 
 shutdown() {

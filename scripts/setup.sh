@@ -54,9 +54,12 @@ publish+=("$DB")
 spacetime "${publish[@]}"
 
 step 'generating client bindings'
-spacetime generate --lang rust \
+# `--include-private` only for the sidecar: `input` is a private table, and the
+# sidecar is the one client allowed to read it. The browser's bindings are
+# generated without it, so the web bundle does not even carry the accessor.
+spacetime generate --lang rust --include-private -y \
   --out-dir sidecar/src/module_bindings --module-path module
-spacetime generate --lang typescript \
+spacetime generate --lang typescript -y \
   --out-dir web/src/module_bindings --module-path module
 
 step 'building the shared physics core (native + wasm)'

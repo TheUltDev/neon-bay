@@ -42,8 +42,19 @@ if [ ! -x "$SIDECAR" ]; then
   [ -x "$SIDECAR" ] || SIDECAR="$ROOT/target/release/sidecar.exe"
 fi
 
+# `input` is a private table, which SpacetimeDB shows to the database's owner
+# and to nobody else. The sidecar is that owner -- the identity that published
+# the module -- so it needs that identity's token. Handed over in the
+# environment rather than on the command line, where `ps` would show it.
+TOKEN="$(spacetime login show --token 2>/dev/null | awk '/auth token/ { print $NF }')"
+if [ -z "$TOKEN" ]; then
+  echo 'Could not read an auth token from `spacetime login show --token`.' >&2
+  echo 'The sidecar has to connect as the identity that published the module.' >&2
+  exit 1
+fi
+
 echo 'Starting the authoritative sidecar...'
-"$SIDECAR" --bots "$BOTS" --db "$DB" --uri "$URI" &
+STDB_TOKEN="$TOKEN" "$SIDECAR" --bots "$BOTS" --db "$DB" --uri "$URI" &
 SIDECAR_PID=$!
 
 cleanup() {

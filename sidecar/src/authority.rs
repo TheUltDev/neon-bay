@@ -9,20 +9,42 @@
 //! materialized view it already has. With a couple of dozen rows that costs
 //! nothing and removes an entire class of ordering bug.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use physics::bot::BotBrain;
 use physics::{CarInput, CarState as PhysicsCar, World, MAX_CARS};
-use spacetimedb_sdk::{Identity, Table};
+use spacetimedb_sdk::{ConnectionId, Table};
 
 use crate::module_bindings::*;
 
 /// Ticks between snapshots. 60 Hz simulation / 3 = 20 Hz on the wire.
 pub const SNAPSHOT_EVERY: u64 = 3;
 
+/// How long to wait between claims when the seat is empty, and when it is not.
+/// An empty seat is the gap a standby exists to close, so it is worth one
+/// attempt per round trip; a held one is worth checking in case its lease runs
+/// out, and nothing more.
+const CLAIM_FAST: Duration = Duration::from_millis(100);
+const CLAIM_SLOW: Duration = Duration::from_secs(1);
+
+const BOT_NAMES: [&str; 24] = [
+    "VECTOR", "NITRO", "HALCYON", "RIPTIDE", "ZEPHYR", "OBSIDIAN", "QUASAR", "MAVERICK", "TEMPEST",
+    "CINDER", "ONYX", "VAPOR", "PHANTOM", "COBALT", "MERIDIAN", "VORTEX", "EMBER", "HALIDE",
+    "SABLE", "KESTREL", "AURORA", "BASALT", "TALON", "MIRAGE",
+];
+const BOT_COLORS: [u32; 24] = [
+    0xff4d6d, 0x4dd2ff, 0xffd166, 0x8affc1, 0xc77dff, 0xff9f45, 0x5fa8ff, 0xff6ec7, 0x9dff5f,
+    0x00e5c0, 0xffe066, 0xff5f5f, 0xa78bfa, 0x34d399, 0xf59e0b, 0x38bdf8, 0xfb7185, 0x84cc16,
+    0x22d3ee, 0xe879f9, 0xfacc15, 0x60a5fa, 0xf97316, 0x2dd4bf,
+];
+
 /// Rebuild the simulation's view of a car from a published row. The inverse of
 /// the mapping in [`Authority::publish`].
+///
+/// The four fields left at their default -- `slip_f`, `slip_r`, `impact`,
+/// `wall` -- are the ones not on the wire. Each is overwritten before it is
+/// next read, so resuming without them is exact rather than approximate.
 fn from_row(r: &CarState) -> PhysicsCar {
     PhysicsCar {
         x: r.x,
@@ -33,8 +55,6 @@ fn from_row(r: &CarState) -> PhysicsCar {
         omega: r.omega,
         steer: r.steer,
         ax: r.ax,
-        slip_f: 0.0,
-        slip_r: 0.0,
         wheel_spin: r.wheel_spin,
         rpm: r.rpm,
         gear: r.gear as f32,
@@ -46,13 +66,12 @@ fn from_row(r: &CarState) -> PhysicsCar {
         lap_start: r.lap_start,
         last_lap: r.last_lap,
         best_lap: r.best_lap,
-        impact: 0.0,
-        wall: 0.0,
         active: 1.0,
+        ..Default::default()
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Slot {
     car_id: u32,
     is_bot: bool,
@@ -73,13 +92,25 @@ pub struct Authority {
     slots: [Option<Slot>; MAX_CARS],
     /// Rotating grid position so late joiners do not spawn inside each other.
     next_grid: usize,
-    identity: Identity,
+    /// This process's connection, which is what the module's lease is held
+    /// against. Not the identity: a standby runs on the same credentials.
+    connection: ConnectionId,
+    /// How many bots this sidecar wants on the grid once it is the authority.
+    bots: usize,
     has_authority: bool,
+    /// Newest tick adopted while standing by. See [`Authority::follow`].
+    followed: u64,
+    /// Who held the lease last tick, so the moment it comes free is noticed
+    /// rather than waited for.
+    held_by: Option<ConnectionId>,
     last_claim: Instant,
     /// Cached: scoring it runs a scripted race, and re-claiming is a loop.
     fingerprint: u32,
     // --- telemetry ---
-    pub sim_time: Duration,
+    /// Everything one tick costs: pumping the connection, reading the cache,
+    /// driving the bots, simulating and publishing. Timed by the caller, which
+    /// is the only place that can see the whole tick.
+    pub tick_time: Duration,
     pub ticks_this_second: u32,
     pub snapshots_this_second: u32,
     pub inputs_applied: u32,
@@ -87,16 +118,19 @@ pub struct Authority {
 }
 
 impl Authority {
-    pub fn new(identity: Identity) -> Self {
+    pub fn new(connection: ConnectionId, bots: usize) -> Self {
         Authority {
             world: World::new(),
             slots: [const { None }; MAX_CARS],
             next_grid: 0,
-            identity,
+            connection,
+            bots: bots.min(BOT_NAMES.len()),
             has_authority: false,
+            followed: 0,
+            held_by: None,
             last_claim: Instant::now() - Duration::from_secs(5),
             fingerprint: physics::fingerprint(),
-            sim_time: Duration::ZERO,
+            tick_time: Duration::ZERO,
             ticks_this_second: 0,
             snapshots_this_second: 0,
             inputs_applied: 0,
@@ -104,44 +138,116 @@ impl Authority {
         }
     }
 
-    /// One simulation tick.
+    /// One simulation tick, or one tick of standing by.
     pub fn step(&mut self, conn: &DbConnection) {
-        self.check_authority(conn);
         self.sync_cars(conn);
+        self.check_authority(conn);
         self.pull_inputs(conn);
-        self.drive_bots();
-
-        let t0 = Instant::now();
-        self.world.step(self.world.active);
-        self.sim_time += t0.elapsed();
         self.ticks_this_second += 1;
-
-        if self.has_authority && self.world.tick % SNAPSHOT_EVERY == 0 {
+        // Standing by: the holder's snapshots are the truth, and simulating a
+        // second opinion would only be thrown away when the next one lands.
+        if !self.has_authority {
+            return;
+        }
+        self.drive_bots();
+        self.world.step(self.world.active);
+        if self.world.tick % SNAPSHOT_EVERY == 0 {
             self.publish(conn);
         }
     }
 
-    /// Claim, or re-claim, the right to write simulation state.
+    /// Hold the authority, take it, or stand by ready to.
+    ///
+    /// Every process runs this, and the one holding the lease is simply the one
+    /// whose claim the database committed first. The loser is not idle: it
+    /// tracks the race it is not running, so that when the seat comes free --
+    /// because the holder exited, or because it went quiet long enough for its
+    /// lease to lapse -- it can carry on rather than start.
     fn check_authority(&mut self, conn: &DbConnection) {
         let Some(cfg) = conn.db.config().id().find(&0) else {
             return;
         };
-        let mine = cfg.sidecar == Some(self.identity) && cfg.sidecar_online;
-        if mine {
+        if cfg.holder == Some(self.connection) {
             if !self.has_authority {
+                self.has_authority = true;
+                self.world.tick = cfg.server_tick + 1;
                 println!("[authority] granted; publishing from tick {}", self.world.tick);
+                self.reconcile_bots(conn);
             }
-            self.has_authority = true;
             return;
         }
         if self.has_authority {
-            println!("[authority] lost, re-claiming");
+            println!("[authority] lease lost to another sidecar; standing by");
+            self.has_authority = false;
+            self.followed = 0;
         }
-        self.has_authority = false;
-        if self.last_claim.elapsed() > Duration::from_secs(1) {
+        self.follow(conn, cfg.server_tick);
+        // A seat that has just come free is worth taking on this tick rather
+        // than on the next poll: the gap a standby exists to close is measured
+        // in milliseconds, and waiting out a retry interval would dominate it.
+        if cfg.holder.is_none() && self.held_by.is_some() {
+            self.last_claim = Instant::now() - CLAIM_SLOW;
+        }
+        self.held_by = cfg.holder;
+        let wait = if cfg.holder.is_none() { CLAIM_FAST } else { CLAIM_SLOW };
+        if self.last_claim.elapsed() > wait {
             self.last_claim = Instant::now();
             let _ = conn.reducers.claim_authority(self.fingerprint);
         }
+    }
+
+    /// Track the published race without writing to it.
+    ///
+    /// A standby that only watched would still be a cold start: the moment a
+    /// player touched a control it never saw, its world would be somewhere
+    /// else. Adopting each snapshot as it lands costs one copy per car per
+    /// 50 ms and makes a promotion a continuation instead of a restart.
+    fn follow(&mut self, conn: &DbConnection, server_tick: u64) {
+        if server_tick <= self.followed {
+            return;
+        }
+        self.followed = server_tick;
+        for st in conn.db.car_state().iter() {
+            if (st.slot as usize) < MAX_CARS && st.tick > 0 {
+                self.world.adopt(st.slot as usize, from_row(&st));
+            }
+        }
+        self.world.tick = server_tick + 1;
+    }
+
+    /// Bring the bot field to the requested count, keeping whoever is already
+    /// out there. A sidecar that has just taken over inherits the previous
+    /// one's bots -- it resumed them from their last published pose -- so this
+    /// only adds or removes the difference.
+    fn reconcile_bots(&self, conn: &DbConnection) {
+        let existing: Vec<(u32, String)> = conn
+            .db
+            .car()
+            .iter()
+            .filter(|c| c.is_bot)
+            .map(|c| (c.car_id, c.name.clone()))
+            .collect();
+
+        for (car_id, name) in existing.iter().skip(self.bots) {
+            println!("[grid] retiring bot {name}");
+            let _ = conn.reducers.despawn_bot(*car_id);
+        }
+        let mut added = 0;
+        for (i, name) in BOT_NAMES.iter().enumerate() {
+            if existing.len() + added >= self.bots {
+                break;
+            }
+            if existing.iter().any(|(_, n)| n == name) {
+                continue;
+            }
+            let _ = conn.reducers.spawn_bot((*name).to_string(), BOT_COLORS[i]);
+            added += 1;
+        }
+        println!(
+            "[grid] bots: {} already racing, {added} added, {} retired",
+            existing.len().min(self.bots),
+            existing.len().saturating_sub(self.bots)
+        );
     }
 
     /// Reconcile the physics world with the `car` table.
@@ -184,25 +290,18 @@ impl Authority {
                 car_id: car.car_id,
                 is_bot: car.is_bot,
                 brain: car.is_bot.then(|| BotBrain::new(car.car_id.wrapping_mul(2654435761))),
-                ack_seq: 0,
-                last_respawn: 0,
-                pending: VecDeque::new(),
-                current: CarInput::default(),
+                ..Default::default()
             });
-            match resumed {
-                Some(tick) => println!(
-                    "[grid] slot {slot} <- {} \"{}\" (car {}) resumed from tick {tick}",
-                    if car.is_bot { "bot" } else { "player" },
-                    car.name,
-                    car.car_id
-                ),
-                None => println!(
-                    "[grid] slot {slot} <- {} \"{}\" (car {}) on the grid",
-                    if car.is_bot { "bot" } else { "player" },
-                    car.name,
-                    car.car_id
-                ),
-            }
+            println!(
+                "[grid] slot {slot} <- {} \"{}\" (car {}) {}",
+                if car.is_bot { "bot" } else { "player" },
+                car.name,
+                car.car_id,
+                match resumed {
+                    Some(tick) => format!("resumed from tick {tick}"),
+                    None => "on the grid".into(),
+                }
+            );
         }
 
         for slot in 0..MAX_CARS {
@@ -223,15 +322,10 @@ impl Authority {
     /// that shows up late is applied immediately -- there is no rewinding the
     /// authority -- and the client absorbs the difference on its next rollback.
     fn pull_inputs(&mut self, conn: &DbConnection) {
-        let by_car: HashMap<u32, usize> = (0..MAX_CARS)
-            .filter_map(|i| self.slots[i].as_ref().map(|s| (s.car_id, i)))
-            .collect();
-
         for row in conn.db.input().iter() {
-            let Some(&slot) = by_car.get(&row.car_id) else {
-                continue;
-            };
-            let Some(state) = self.slots[slot].as_mut() else {
+            let Some((slot, state)) = self.slots.iter_mut().enumerate().find_map(|(i, s)| {
+                s.as_mut().filter(|s| s.car_id == row.car_id).map(|s| (i, s))
+            }) else {
                 continue;
             };
             if row.seq != state.ack_seq {
@@ -304,8 +398,10 @@ impl Authority {
                 continue;
             }
             let c = &self.world.cars[slot];
-            states.push(StateUpdate {
+            states.push(CarState {
                 car_id: s.car_id,
+                slot: slot as u32,
+                tick: self.world.tick,
                 ack_seq: s.ack_seq,
                 x: c.x,
                 y: c.y,
@@ -330,9 +426,10 @@ impl Authority {
                 wall: c.wall > 0.5,
             });
         }
-        if states.is_empty() {
-            return;
-        }
+        // An empty grid still publishes, because this call is also the lease's
+        // heartbeat: a sidecar that went quiet because there was nothing to say
+        // would look exactly like one that had wedged, and lose the seat to a
+        // standby every two seconds.
         if let Err(e) = conn.reducers.push_states(self.world.tick, states) {
             eprintln!("[publish] {e}");
         }
@@ -361,12 +458,12 @@ impl Authority {
             self.snapshots_this_second as f32 / elapsed,
             cars,
             bots,
-            self.sim_time.as_secs_f32() * 1e6 / ticks as f32,
-            self.sim_time.as_secs_f32() / elapsed * 100.0,
+            self.tick_time.as_secs_f32() * 1e6 / ticks as f32,
+            self.tick_time.as_secs_f32() / elapsed * 100.0,
             self.inputs_applied,
-            if self.has_authority { "" } else { " | NO AUTHORITY" },
+            if self.has_authority { "" } else { " | STANDBY" },
         );
-        self.sim_time = Duration::ZERO;
+        self.tick_time = Duration::ZERO;
         self.ticks_this_second = 0;
         self.snapshots_this_second = 0;
         self.inputs_applied = 0;

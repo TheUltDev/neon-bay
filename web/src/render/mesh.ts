@@ -41,6 +41,11 @@ export class MeshBuilder {
   private tx = 0;
   private ty = 0;
   private saved: number[] = [];
+  // Per-vertex normals for `ribbon` and `halo`. Reused: a car outline is
+  // extruded twice a frame per car, and neither keeps the buffer past the
+  // call, so a fresh pair of typed arrays each time is pure garbage.
+  private nx = new Float32Array(16);
+  private ny = new Float32Array(16);
 
   constructor(capacity = 4096) {
     this.data = new Float32Array(capacity * VERT_FLOATS);
@@ -56,6 +61,13 @@ export class MeshBuilder {
   /** Vertices written, as a count of floats -- what an upload wants. */
   get floats(): number {
     return this.n * VERT_FLOATS;
+  }
+
+  /** Grow the extrusion scratch to hold `count` vertices. */
+  private normals(count: number) {
+    if (this.nx.length >= count) return;
+    this.nx = new Float32Array(count);
+    this.ny = new Float32Array(count);
   }
 
   private room(verts: number) {
@@ -250,8 +262,9 @@ export class MeshBuilder {
    */
   ribbon(pts: ArrayLike<number>, count: number, width: number, closed: boolean) {
     const half = width / 2;
-    const nx = new Float32Array(count);
-    const ny = new Float32Array(count);
+    this.normals(count);
+    const nx = this.nx;
+    const ny = this.ny;
     for (let i = 0; i < count; i++) {
       const p = i === 0 ? (closed ? count - 1 : 0) : i - 1;
       const n = i === count - 1 ? (closed ? 0 : count - 1) : i + 1;
@@ -336,8 +349,9 @@ export class MeshBuilder {
       area += pts[i * 2] * pts[j * 2 + 1] - pts[j * 2] * pts[i * 2 + 1];
     }
     const sign = area > 0 ? -1 : 1;
-    const ox = new Float32Array(count);
-    const oy = new Float32Array(count);
+    this.normals(count);
+    const ox = this.nx;
+    const oy = this.ny;
     for (let i = 0; i < count; i++) {
       const p = (i + count - 1) % count;
       const n = (i + 1) % count;

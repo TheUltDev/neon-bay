@@ -7,7 +7,9 @@
 //                so steering feels instant regardless of ping.
 //   2. RECONCILE when an authoritative snapshot arrives for tick T, compare it
 //                with what we predicted for T. If they differ, rewind to the
-//                server's state and replay the inputs from T+1 to now.
+//                server's state and replay the inputs from T+1 to now -- with
+//                the other cars put back where they were at each replayed
+//                tick, so the contact is the one the authority resolved.
 //   3. SMOOTH    a rewind moves the car. Rather than teleport, keep the visual
 //                error as an offset and decay it to zero over ~200 ms.
 //   4. INTERPOLATE the simulation moves in 60 Hz jumps and the display does not.
@@ -111,7 +113,7 @@ export interface NetStats {
   lastSnapshotTick: number;
 }
 
-function wrapPi(a: number): number {
+export function wrapPi(a: number): number {
   while (a > Math.PI) a -= Math.PI * 2;
   while (a < -Math.PI) a += Math.PI * 2;
   return a;
@@ -161,6 +163,17 @@ export class Sim {
   private prevHeading = 0;
   private prevSteer = 0;
   private havePrev = false;
+
+  /**
+   * Called before each replayed tick, so the caller can put the remote cars
+   * where the authority had them *then*.
+   *
+   * Without it a rollback re-runs the last few ticks against rivals frozen at
+   * wherever they are now, which is a different collision from the one the
+   * authority resolved -- so the replay disagrees, and the next snapshot
+   * corrects it again.
+   */
+  onReplayTick: ((tick: number) => void) | null = null;
 
   stats: NetStats = {
     error: 0,
@@ -225,13 +238,14 @@ export class Sim {
   step(input: Input) {
     if (this.localSlot < 0) return;
     const slot = this.localSlot;
-    const h = this.localTick % HISTORY;
+    const hi = (this.localTick % HISTORY) * 4;
+    const si = slot * 4;
 
-    this.histTick[h] = this.localTick;
-    this.histInput[h * 4] = input.throttle;
-    this.histInput[h * 4 + 1] = input.steer;
-    this.histInput[h * 4 + 2] = input.brake;
-    this.histInput[h * 4 + 3] = input.handbrake;
+    // The controls go to the simulation and into the replay log together.
+    this.inputs[si] = this.histInput[hi] = input.throttle;
+    this.inputs[si + 1] = this.histInput[hi + 1] = input.steer;
+    this.inputs[si + 2] = this.histInput[hi + 2] = input.brake;
+    this.inputs[si + 3] = this.histInput[hi + 3] = input.handbrake;
 
     const b = slot * this.stride;
     this.prevX = this.cars[b + F.x];
@@ -240,22 +254,18 @@ export class Sim {
     this.prevSteer = this.cars[b + F.steer];
     this.havePrev = true;
 
-    this.applyInput(slot, input);
     this.wasm.phys_set_tick(this.localTick);
     this.wasm.phys_step(1 << slot);
     this.localTick++;
-
-    const nh = this.localTick % HISTORY;
-    this.histTick[nh] = this.localTick;
-    this.histState.set(this.cars.subarray(slot * this.stride, (slot + 1) * this.stride), nh * this.stride);
+    this.record(this.localTick);
   }
 
-  private applyInput(slot: number, input: Input) {
-    const b = slot * 4;
-    this.inputs[b] = input.throttle;
-    this.inputs[b + 1] = input.steer;
-    this.inputs[b + 2] = input.brake;
-    this.inputs[b + 3] = input.handbrake;
+  /** File the local car's current state as what was simulated for `tick`. */
+  private record(tick: number) {
+    const h = tick % HISTORY;
+    const b = this.localSlot * this.stride;
+    this.histTick[h] = tick;
+    this.histState.set(this.cars.subarray(b, b + this.stride), h * this.stride);
   }
 
   /**
@@ -320,13 +330,10 @@ export class Sim {
       const j = t % HISTORY;
       if (this.histTick[j] !== t) break;
       this.inputs.set(this.histInput.subarray(j * 4, j * 4 + 4), slot * 4);
+      this.onReplayTick?.(t);
       this.wasm.phys_set_tick(t);
       this.wasm.phys_step(1 << slot);
-      const nj = (t + 1) % HISTORY;
-      this.histState.set(
-        this.cars.subarray(slot * this.stride, (slot + 1) * this.stride),
-        nj * this.stride,
-      );
+      this.record(t + 1);
       replayed++;
     }
 
@@ -350,9 +357,7 @@ export class Sim {
     this.wasm.phys_reproject(slot);
     this.localTick = tick;
     this.histTick.fill(-1);
-    const h = tick % HISTORY;
-    this.histTick[h] = tick;
-    this.histState.set(this.cars.subarray(slot * this.stride, (slot + 1) * this.stride), h * this.stride);
+    this.record(tick);
     this.offX = this.offY = this.offHeading = 0;
     this.havePrev = false;
   }

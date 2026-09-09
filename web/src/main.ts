@@ -1,6 +1,11 @@
-// Entry point: fixed-step prediction loop, entity interpolation for everyone
-// else, and the clock sync that keeps the client running just far enough ahead
-// of the sidecar that its inputs arrive on time.
+// Entry point: fixed-step prediction loop, prediction of everyone else from
+// their last published pose, and the clock sync that keeps the client running
+// just far enough ahead of the sidecar that its inputs arrive on time.
+//
+// One clock runs the whole picture: the tick the local car is predicting. The
+// rivals it leans on are carried forward to that same tick, so what you see,
+// what you hit, and what the authority resolves are the same arrangement of
+// cars -- rather than a local car in the future beside rivals in the past.
 
 import { GameAudio, type Bus } from './audio';
 import { Hud, type GfxState, type HudState, type LeaderRow } from './hud';
@@ -11,8 +16,6 @@ import { DT, F, loadSim, type Sim } from './sim';
 
 /** Extra ticks of headroom on top of the measured round trip. */
 const LEAD_MARGIN = 2;
-/** How far behind the authority remote cars are drawn, in ticks. */
-const INTERP_TICKS = 4.5;
 /** Inputs per second sent upstream. */
 const INPUT_HZ = 30;
 /** Instrument panel repaints per second. It is telemetry, not a mirror, and
@@ -44,6 +47,7 @@ async function boot() {
   // canvas element on the way down -- a canvas only ever gets one kind of
   // context -- so nothing below should hold on to the one it started with.
   let renderer = await createRenderer($<HTMLCanvasElement>('stage'), sim);
+  const mini = $<HTMLCanvasElement>('minimap');
   const hud = new Hud();
   const controls = new Controls();
   const audio = new GameAudio();
@@ -168,6 +172,9 @@ async function boot() {
 
   // --- reconciliation hook -------------------------------------------------
   let pendingToast = 0;
+  // A rollback re-runs the last few ticks. The rivals have to go back with it,
+  // or the replayed contact is not the contact the authority resolved.
+  sim.onReplayTick = (tick) => placeRemotes(sim, net, tick);
   net.onLocalSnapshot = (snap) => {
     const before = sim.stats.resyncs;
     sim.reconcile(snap.tick, snap.state);
@@ -337,13 +344,16 @@ async function boot() {
     while (acc >= DT && steps < 6) {
       acc -= DT;
       steps++;
-      placeRemotes(sim, net, serverNow - INTERP_TICKS);
       if (sim.localSlot >= 0) {
         const input = controls.read(forwardSpeed(sim));
         // Stamp the tick this input *drives*, i.e. the one before the step it is
         // about to take. The sidecar holds it until its own clock reaches that
         // tick, which is what keeps the two simulations in lockstep.
         const inputTick = sim.localTick;
+        // The rivals are solid, so they have to be where the authority will
+        // have them for the tick about to run -- not where the last snapshot
+        // left them a round trip ago.
+        placeRemotes(sim, net, sim.localTick);
         sim.step(input);
         sinceInput += DT;
         if (sinceInput >= 1 / INPUT_HZ) {
@@ -352,7 +362,6 @@ async function boot() {
         }
       }
     }
-    if (steps === 0) placeRemotes(sim, net, serverNow - INTERP_TICKS);
     if (acc > DT * 6) acc = 0;
 
     sim.decaySmoothing(dt);
@@ -363,7 +372,12 @@ async function boot() {
     // being sampled at a fractional tick; the local car needs it handed over,
     // or it is the only thing on screen that moves in 60 Hz steps.
     const alpha = acc / DT;
-    const cars = collectCars(sim, net, serverNow - INTERP_TICKS, alpha);
+    // Everything on screen lives on one clock: the tick the local car has just
+    // predicted. A spectator has no car to predict, so it watches the
+    // authority's instead.
+    const drawTick = sim.localSlot >= 0 ? sim.localTick - 1 + alpha : serverNow;
+    net.viewTick = drawTick;
+    const cars = collectCars(sim, net, drawTick, alpha);
     const local = cars.find((c) => c.isLocal) ?? null;
     const followed = local ?? leader(cars);
 
@@ -389,7 +403,7 @@ async function boot() {
 
     const ghost = ghostPose(net);
     renderer.draw(cars, ghost, dt, local ? local.speed : 0);
-    renderer.drawMinimap($<HTMLCanvasElement>('minimap'), sim, cars);
+    renderer.drawMinimap(mini, sim, cars);
 
     // ---- telemetry --------------------------------------------------------
     // Every frame, not every HUD repaint: this is counting them.
@@ -433,14 +447,14 @@ function refreshActiveMask(sim: Sim, net: Net) {
 }
 
 /**
- * Park every remote car at its interpolated pose. They are never integrated by
- * this client -- but they are solid, so you can lean on a rival through a
+ * Park every remote car where it belongs at `atTick`. They are never integrated
+ * by this client -- but they are solid, so you can lean on a rival through a
  * corner and the local prediction reacts immediately.
  */
 function placeRemotes(sim: Sim, net: Net, atTick: number) {
   for (const meta of net.cars.values()) {
     if (meta.carId === net.myCarId) continue;
-    const s = net.sampleRemote(meta.carId, atTick);
+    const s = net.predictRemote(meta.carId, atTick);
     if (!s) continue;
     sim.placeRemote(meta.slot, s[F.x], s[F.y], s[F.heading], s[F.vx], s[F.vy]);
   }
@@ -449,43 +463,30 @@ function placeRemotes(sim: Sim, net: Net, atTick: number) {
 function collectCars(sim: Sim, net: Net, atTick: number, alpha: number): DrawCar[] {
   const out: DrawCar[] = [];
   for (const meta of net.cars.values()) {
-    if (meta.carId === net.myCarId && sim.localSlot >= 0) {
-      const pose = sim.localPose(alpha);
-      out.push({
-        slot: meta.slot,
-        x: pose.x,
-        y: pose.y,
-        heading: pose.heading,
-        steer: pose.steer,
-        color: meta.color,
-        name: meta.name,
-        isLocal: true,
-        isBot: false,
-        speed: Math.hypot(sim.field(meta.slot, F.vx), sim.field(meta.slot, F.vy)),
-        wheelSpin: sim.field(meta.slot, F.wheelSpin),
-        braking: sim.inputs[meta.slot * 4 + 2] > 0.1,
-        throttle: sim.inputs[meta.slot * 4],
-        lap: sim.field(meta.slot, F.lap),
-      });
-      continue;
-    }
-    const s = net.sampleRemote(meta.carId, atTick);
+    // Both sources are the same `#[repr(C)]` record: the wasm world holds one
+    // per slot, a snapshot holds exactly one. Only the base offset differs.
+    const local = meta.carId === net.myCarId && sim.localSlot >= 0;
+    const s = local ? sim.cars : net.sampleRemote(meta.carId, atTick);
     if (!s) continue;
+    const b = local ? meta.slot * sim.stride : 0;
+    // The local car is drawn from its predicted pose, which carries the
+    // sub-tick interpolation and whatever correction is still being smoothed.
+    const pose = local ? sim.localPose(alpha) : null;
     out.push({
       slot: meta.slot,
-      x: s[F.x],
-      y: s[F.y],
-      heading: s[F.heading],
-      steer: s[F.steer],
+      x: pose ? pose.x : s[F.x],
+      y: pose ? pose.y : s[F.y],
+      heading: pose ? pose.heading : s[F.heading],
+      steer: pose ? pose.steer : s[F.steer],
       color: meta.color,
       name: meta.name,
-      isLocal: false,
+      isLocal: local,
       isBot: meta.isBot,
-      speed: Math.hypot(s[F.vx], s[F.vy]),
-      wheelSpin: s[F.wheelSpin],
-      braking: false,
-      throttle: 1,
-      lap: s[F.lap],
+      speed: Math.hypot(s[b + F.vx], s[b + F.vy]),
+      wheelSpin: s[b + F.wheelSpin],
+      braking: local && sim.inputs[meta.slot * 4 + 2] > 0.1,
+      throttle: local ? sim.inputs[meta.slot * 4] : 1,
+      lap: s[b + F.lap],
     });
   }
   return out;
@@ -512,23 +513,22 @@ function physicsMismatch(sim: Sim, net: Net): boolean {
 
 /** Latest authoritative pose of the local car, for the ghost overlay. */
 function ghostPose(net: Net) {
-  const buf = net.buffers.get(net.myCarId);
-  if (!buf || buf.length === 0) return null;
-  const s = buf[buf.length - 1].state;
-  return { x: s[F.x], y: s[F.y], heading: s[F.heading] };
+  const s = net.authoritative(net.myCarId);
+  return s ? { x: s[F.x], y: s[F.y], heading: s[F.heading] } : null;
 }
 
 // Rear tires lay the marks: `wheel_spin` is the rear axle's share of the
 // friction budget, so a car only streaks once it is actually sliding.
 const REAR_AXLE = 1.32;
 const REAR_TRACK = 0.95;
+const SIDES = [1, -1];
 
 function spawnEffects(renderer: Renderer, cars: DrawCar[], dt: number) {
   for (const c of cars) {
     if (c.speed < 6 || c.wheelSpin < 0.3) continue;
     const cs = Math.cos(c.heading);
     const sn = Math.sin(c.heading);
-    for (const side of [1, -1]) {
+    for (const side of SIDES) {
       const wx = c.x - cs * REAR_AXLE - sn * REAR_TRACK * side;
       const wy = c.y - sn * REAR_AXLE + cs * REAR_TRACK * side;
       // One id per tire, stable across frames, so each wheel's streak joins up
@@ -551,9 +551,11 @@ function buildHudState(
 ): HudState {
   const slot = sim.localSlot;
   const has = slot >= 0;
-  const speed = has ? Math.hypot(sim.field(slot, F.vx), sim.field(slot, F.vy)) : 0;
-  const lapStart = has ? sim.field(slot, F.lapStart) : 0;
-  const lapTime = has ? Math.max(0, (sim.localTick - lapStart) / 60) : 0;
+  /** A field of the local car, or zero while spectating. */
+  const f = (field: number) => (has ? sim.field(slot, field) : 0);
+  /** One of its four controller channels, likewise. */
+  const inp = (channel: number) => (has ? sim.inputs[slot * 4 + channel] : 0);
+  const lapTime = has ? Math.max(0, (sim.localTick - f(F.lapStart)) / 60) : 0;
 
   // Ten quickest laps the module has on file. If you are not among them, your
   // own row rides along underneath at its true rank rather than vanishing.
@@ -583,16 +585,16 @@ function buildHudState(
     snapshotHz: net.snapshotsPerSec,
     droppedInputs: net.droppedInputs,
     resyncs: sim.stats.resyncs,
-    speedKph: speed * 3.6,
-    gear: has ? sim.field(slot, F.gear) : 1,
-    rpm: has ? sim.field(slot, F.rpm) : 0,
-    throttle: has ? sim.inputs[slot * 4] : 0,
-    brake: has ? sim.inputs[slot * 4 + 2] : 0,
-    steer: has ? sim.inputs[slot * 4 + 1] : 0,
-    lap: has ? sim.field(slot, F.lap) : 0,
+    speedKph: Math.hypot(f(F.vx), f(F.vy)) * 3.6,
+    gear: has ? f(F.gear) : 1,
+    rpm: f(F.rpm),
+    throttle: inp(0),
+    brake: inp(2),
+    steer: inp(1),
+    lap: f(F.lap),
     lapTime,
-    lastLap: has ? sim.field(slot, F.lastLap) : 0,
-    bestLap: has ? sim.field(slot, F.bestLap) : 0,
+    lastLap: f(F.lastLap),
+    bestLap: f(F.bestLap),
     leaderboard: top,
   };
 }
@@ -684,6 +686,7 @@ function frameCounter(): (now: number) => number {
  * every one of them.
  */
 function startRenderOnly(current: () => Renderer, sim: Sim, hud: Hud) {
+  const mini = $<HTMLCanvasElement>('minimap');
   let last = performance.now();
   const measureFps = frameCounter();
   const loop = (now: number) => {
@@ -694,7 +697,7 @@ function startRenderOnly(current: () => Renderer, sim: Sim, hud: Hud) {
     renderer.camY = Math.sin(now / 9000) * 120;
     renderer.camZoom = 6;
     renderer.draw([], null, dt, 0);
-    renderer.drawMinimap($<HTMLCanvasElement>('minimap'), sim, []);
+    renderer.drawMinimap(mini, sim, []);
     // The renderer is the only thing still running, so its panel holds the only
     // live numbers on the page -- which is exactly when the frame rate earns
     // its place.

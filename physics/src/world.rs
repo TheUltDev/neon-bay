@@ -15,6 +15,24 @@ use crate::track::{Track, CHECKPOINTS, NO_HINT};
 
 pub const MAX_CARS: usize = 24;
 
+/// The slots set in `bits`, lowest first.
+///
+/// Same order as scanning `0..MAX_CARS` and testing each one -- which is what
+/// the collision result depends on -- but without walking the empty slots. A
+/// world holding seven cars in twenty-four slots spends most of a step's
+/// bookkeeping on the seventeen that are not there.
+#[inline]
+fn slots(mut bits: u32) -> impl Iterator<Item = usize> {
+    core::iter::from_fn(move || {
+        if bits == 0 {
+            return None;
+        }
+        let i = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        Some(i)
+    })
+}
+
 /// Restitution against the barriers. Low: walls eat your speed.
 const WALL_RESTITUTION: f32 = 0.26;
 /// Restitution car vs car. Higher: contact is bouncy and readable.
@@ -129,47 +147,36 @@ impl World {
         let mask = sim_mask & self.active;
         self.tick = self.tick.wrapping_add(1);
 
-        for i in 0..MAX_CARS {
-            if mask & (1 << i) != 0 {
-                self.cars[i].impact = 0.0;
-                self.cars[i].wall = 0.0;
-            }
+        for i in slots(mask) {
+            self.cars[i].impact = 0.0;
+            self.cars[i].wall = 0.0;
         }
 
         for _ in 0..car::SUBSTEPS {
-            for i in 0..MAX_CARS {
-                if mask & (1 << i) != 0 {
-                    let input = self.inputs[i];
-                    car::integrate(&mut self.cars[i], &input, car::H);
-                }
+            for i in slots(mask) {
+                let input = self.inputs[i];
+                car::integrate(&mut self.cars[i], &input, car::H);
             }
         }
 
-        for i in 0..MAX_CARS {
-            if mask & (1 << i) != 0 {
-                self.resolve_walls(i);
-            }
+        for i in slots(mask) {
+            self.resolve_walls(i);
         }
 
         // Fixed pair order keeps the result independent of iteration whims.
-        for i in 0..MAX_CARS {
-            for j in (i + 1)..MAX_CARS {
+        // Both ends have to be live and at least one of them has to be moving.
+        for i in slots(self.active) {
+            for j in slots(self.active & !((2 << i) - 1)) {
                 let a = mask & (1 << i) != 0;
                 let b = mask & (1 << j) != 0;
-                if !a && !b {
-                    continue;
+                if a || b {
+                    self.resolve_pair(i, j, a, b);
                 }
-                if !self.is_active(i) || !self.is_active(j) {
-                    continue;
-                }
-                self.resolve_pair(i, j, a, b);
             }
         }
 
-        for i in 0..MAX_CARS {
-            if mask & (1 << i) != 0 {
-                self.update_progress(i);
-            }
+        for i in slots(mask) {
+            self.update_progress(i);
         }
     }
 

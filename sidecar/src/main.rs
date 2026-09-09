@@ -24,25 +24,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use spacetimedb_sdk::{credentials, DbContext, Identity, Table};
+use spacetimedb_sdk::{credentials, DbContext};
 
 use authority::Authority;
 use module_bindings::*;
 
 const TICK: Duration = Duration::from_nanos(16_666_667);
-/// Stop sleeping this long before the deadline and spin instead. No mainstream
-/// scheduler wakes a thread accurately enough for a 60 Hz tick on its own --
-/// Windows is the worst of them, but Linux and macOS overshoot too.
-const SPIN_MARGIN: Duration = Duration::from_micros(1500);
-
-const BOT_NAMES: [&str; 12] = [
-    "VECTOR", "NITRO", "HALCYON", "RIPTIDE", "ZEPHYR", "OBSIDIAN", "QUASAR", "MAVERICK", "TEMPEST",
-    "CINDER", "ONYX", "VAPOR",
-];
-const BOT_COLORS: [u32; 12] = [
-    0xff4d6d, 0x4dd2ff, 0xffd166, 0x8affc1, 0xc77dff, 0xff9f45, 0x5fa8ff, 0xff6ec7, 0x9dff5f,
-    0x00e5c0, 0xffe066, 0xff5f5f,
-];
 
 struct Args {
     uri: String,
@@ -60,31 +47,16 @@ fn parse_args() -> Args {
         token: std::env::var("STDB_TOKEN").ok(),
         quiet: false,
     };
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
-    while i < argv.len() {
-        let next = || argv.get(i + 1).cloned().unwrap_or_default();
-        match argv[i].as_str() {
-            "--uri" => {
-                a.uri = next();
-                i += 1;
-            }
-            "--db" => {
-                a.db = next();
-                i += 1;
-            }
-            "--bots" => {
-                a.bots = next().parse().unwrap_or(5);
-                i += 1;
-            }
-            "--token" => {
-                a.token = Some(next());
-                i += 1;
-            }
+    let mut argv = std::env::args().skip(1);
+    while let Some(flag) = argv.next() {
+        match flag.as_str() {
+            "--uri" => a.uri = argv.next().unwrap_or_default(),
+            "--db" => a.db = argv.next().unwrap_or_default(),
+            "--bots" => a.bots = argv.next().and_then(|v| v.parse().ok()).unwrap_or(a.bots),
+            "--token" => a.token = argv.next(),
             "--quiet" => a.quiet = true,
             other => eprintln!("ignoring unknown argument {other}"),
         }
-        i += 1;
     }
     a
 }
@@ -97,27 +69,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
     println!("physics sidecar -> {} / {}", args.uri, args.db);
 
-    let connected = Arc::new(AtomicBool::new(false));
     let subscribed = Arc::new(AtomicBool::new(false));
-    let identity: Arc<std::sync::Mutex<Option<Identity>>> = Arc::default();
-
     let token = args.token.clone().or_else(|| creds().load().ok().flatten());
 
     let conn = DbConnection::builder()
         .with_uri(args.uri.as_str())
         .with_database_name(args.db.as_str())
         .with_token(token)
-        .on_connect({
-            let connected = connected.clone();
-            let identity = identity.clone();
-            move |_ctx, id, tok| {
-                if let Err(e) = creds().save(tok) {
-                    eprintln!("could not cache credentials: {e}");
-                }
-                *identity.lock().unwrap() = Some(id);
-                connected.store(true, Ordering::SeqCst);
-                println!("connected as {id}");
+        .on_connect(|_ctx, id, tok| {
+            if let Err(e) = creds().save(tok) {
+                eprintln!("could not cache credentials: {e}");
             }
+            println!("connected as {id}");
         })
         .on_connect_error(|_ctx, err| {
             eprintln!("connection failed: {err}");
@@ -144,6 +107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .on_error(|_ctx, err| {
             eprintln!("subscription error: {err}");
+            if err.to_string().contains("input") {
+                eprintln!("  `input` is private, so only the identity that published the module");
+                eprintln!("  can read it. Start the sidecar with that identity's token:");
+                eprintln!("    STDB_TOKEN=\"$(spacetime login show --token | awk '/auth token/ {{ print $NF }}')\"");
+            }
             std::process::exit(1);
         })
         .subscribe([
@@ -164,46 +132,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_millis(2));
     }
 
-    let me = identity.lock().unwrap().expect("identity after connect");
     check_config(&conn)?;
 
-    conn.reducers.claim_authority(physics::fingerprint())?;
-    let mut sim = Authority::new(me);
-
-    // Resume the tick counter where the last authority left off. The module
-    // rejects snapshots older than the row it already holds, so a sidecar that
-    // restarted from tick zero would have every write silently ignored.
-    if let Some(cfg) = conn.db.config().id().find(&0) {
-        sim.world.tick = cfg.server_tick + 1;
-        println!("resuming simulation clock at tick {}", sim.world.tick);
-    }
-
-    // Give the claim a moment to land, then fill the grid with bots.
-    let settle = Instant::now() + Duration::from_millis(750);
-    while Instant::now() < settle {
-        conn.frame_tick()?;
-        thread::sleep(Duration::from_millis(5));
-    }
-    reconcile_bots(&conn, args.bots)?;
-
+    // Claiming, resuming the tick clock and filling the grid with bots all
+    // happen the moment this process is granted the authority -- which may be
+    // now, or may be after the sidecar that currently holds it goes away. Until
+    // then it stands by, following the race it is not running.
+    let mut sim = Authority::new(conn.connection_id(), args.bots);
     println!(
         "simulating at {} Hz, publishing at {} Hz",
         physics::TICK_HZ,
         physics::TICK_HZ as u64 / authority::SNAPSHOT_EVERY
     );
 
+    let mut pacer = Pacer::new();
     let mut next = Instant::now();
     loop {
         // --- wait for the tick boundary ----------------------------------
         let now = Instant::now();
         if next > now {
-            let remain = next - now;
-            if remain > SPIN_MARGIN {
-                thread::sleep(remain - SPIN_MARGIN);
-            }
-            while Instant::now() < next {
-                std::hint::spin_loop();
-            }
+            pacer.wait(next);
         } else if now - next > TICK * 8 {
             // Fell a long way behind (a debugger, a laptop lid). Resync rather
             // than trying to catch up and stuttering everyone's prediction.
@@ -212,8 +160,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         next += TICK;
 
+        // Everything between here and the next boundary is the tick's real
+        // cost: the SDK pump delivers the inputs and the echoes of our own
+        // snapshots, and `step` does the rest. The wait above is not work.
+        let work = Instant::now();
         conn.frame_tick()?;
         sim.step(&conn);
+        sim.tick_time += work.elapsed();
         if !args.quiet {
             sim.report();
         }
@@ -259,41 +212,60 @@ fn check_config(conn: &DbConnection) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Bring the bot field to `count`, keeping whoever is already out there.
+/// Sleeps to a deadline as accurately as this machine allows, and no longer.
 ///
-/// A restarting sidecar inherits the previous one's bots -- it resumes them from
-/// their last published pose -- so this only adds or removes the difference.
-fn reconcile_bots(conn: &DbConnection, count: usize) -> Result<(), Box<dyn std::error::Error>> {
-    let want = count.min(BOT_NAMES.len());
-    let existing: Vec<(u32, String)> = conn
-        .db
-        .car()
-        .iter()
-        .filter(|c| c.is_bot)
-        .map(|c| (c.car_id, c.name.clone()))
-        .collect();
+/// A thread asked to sleep for `d` wakes some time *after* `d`, and how long
+/// after is the platform's business: tens of microseconds on Linux, most of a
+/// millisecond on Windows, a whole scheduling quantum on a busy machine. The
+/// way to hit a 60 Hz boundary anyway is to sleep short and spin the rest --
+/// but a fixed margin is a guess, and a guess is either a stutter or a core
+/// burnt on every machine it was not tuned on.
+///
+/// So measure it instead. `margin` rises to the worst overshoot it has seen and
+/// decays back down as wakeups improve, which spins for exactly as long as the
+/// scheduler underneath currently needs and no longer. On the Windows box these
+/// numbers come from it settles near 0.5 ms and spins 1.5 % of a core; a fixed
+/// 1.5 ms, which is what covers the same machine on a bad day, spins 7 %. The
+/// price is a tick that occasionally lands a tenth of a millisecond late, which
+/// nothing downstream can tell from one that did not: the tick a snapshot
+/// carries is a number, not a timestamp.
+struct Pacer {
+    margin: Duration,
+}
 
-    for (car_id, name) in existing.iter().skip(want) {
-        println!("retiring bot {name}");
-        conn.reducers.despawn_bot(*car_id)?;
+impl Pacer {
+    /// Where the estimate starts, and the range it may wander in. The floor is
+    /// not zero because no wakeup is free; the ceiling is a quarter of a tick,
+    /// past which spinning costs more than the accuracy is worth.
+    const START: Duration = Duration::from_micros(1000);
+    const FLOOR: Duration = Duration::from_micros(50);
+    const CEILING: Duration = Duration::from_micros(4000);
+    /// Shrink per wakeup. One percent at 60 Hz is a half-life of about a
+    /// second: long enough that a bad wakeup still covers the next few dozen,
+    /// short enough that one outlier does not tax the next ten seconds. Being
+    /// wrong costs a tick that lands a few hundred microseconds late, which
+    /// nothing downstream can tell from one that did not.
+    const DECAY: f32 = 0.99;
+
+    fn new() -> Self {
+        Pacer { margin: Self::START }
     }
 
-    let taken: Vec<&str> = existing.iter().map(|(_, n)| n.as_str()).collect();
-    let mut added = 0;
-    for (i, name) in BOT_NAMES.iter().enumerate() {
-        if existing.len() + added >= want {
-            break;
+    fn wait(&mut self, deadline: Instant) {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain > self.margin {
+            let ask = remain - self.margin;
+            let before = Instant::now();
+            thread::sleep(ask);
+            let over = before.elapsed().saturating_sub(ask);
+            self.margin = if over > self.margin {
+                over.min(Self::CEILING)
+            } else {
+                self.margin.mul_f32(Self::DECAY).max(Self::FLOOR)
+            };
         }
-        if taken.contains(name) {
-            continue;
+        while Instant::now() < deadline {
+            std::hint::spin_loop();
         }
-        conn.reducers.spawn_bot((*name).to_string(), BOT_COLORS[i])?;
-        added += 1;
     }
-    println!(
-        "bots: {} already racing, {added} added, {} retired",
-        existing.len().min(want),
-        existing.len().saturating_sub(want)
-    );
-    Ok(())
 }

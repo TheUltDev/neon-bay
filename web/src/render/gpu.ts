@@ -19,16 +19,11 @@ import type { Sim } from '../sim';
 import { BaseRenderer, MARK_SIZE, TIRE_WIDTH } from './base';
 import { Mode, Tex, type GpuDevice, type GpuMesh } from './device';
 import { MeshBuilder } from './mesh';
-import { ASPHALT_TILE, CAR_OUTLINE, EDGE_GLOW, EDGE_RGB, hslRgb, shadeRgb } from './palette';
+import { ASPHALT_TILE, CAR_OUTLINE, EDGE_GLOW, EDGE_RGB, hslRgb, shadeRgb, WHEELS } from './palette';
 import type { DrawCar, GhostCar, RendererInfo } from './types';
 
-/** Wheel positions in the car frame, and whether the wheel steers. */
-const WHEELS = [
-  [1.28, 0.92, 1],
-  [1.28, -0.92, 1],
-  [-1.32, 0.95, 0],
-  [-1.32, -0.95, 0],
-] as const;
+/** Where the two brake lights sit along the tail. */
+const BRAKE_LIGHTS = [-0.8, 0.3];
 
 /** Grid spacing on the ground plane, in metres. */
 const GRID_STEP = 10;
@@ -445,7 +440,7 @@ export class GpuRenderer extends BaseRenderer {
     }
 
     // Brake lights, glowing when they are on.
-    for (const y of [-0.8, 0.3]) {
+    for (const y of BRAKE_LIGHTS) {
       if (c.braking) {
         rectPts(this.quadPts, -2.12, y, 0.18, 0.5);
         mb.halo(this.quadPts, 4, 0.3, 1, 45 / 255, 85 / 255, 0.5);

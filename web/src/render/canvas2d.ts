@@ -29,7 +29,7 @@
 
 import type { Sim } from '../sim';
 import { BaseRenderer, MARK_SIZE, TIRE_WIDTH } from './base';
-import { ASPHALT_TILE, asphaltPixels, CAR_OUTLINE, EDGE_GLOW, shade } from './palette';
+import { ASPHALT_TILE, asphaltPixels, CAR_OUTLINE, EDGE_GLOW, EDGE_RGB, shade, WHEELS } from './palette';
 import type { DrawCar, GhostCar, RendererInfo } from './types';
 
 export class Canvas2DRenderer extends BaseRenderer {
@@ -46,6 +46,10 @@ export class Canvas2DRenderer extends BaseRenderer {
   private startLine = new Path2D();
   private chequerA = new Path2D();
   private chequerB = new Path2D();
+  private edges = EDGE_RGB.map((rgb, i) => ({
+    path: i === 0 ? this.edgeL : this.edgeR,
+    strokes: EDGE_GLOW.map(([width, alpha]) => ({ width, style: `rgba(${rgb.join(',')},${alpha})` })),
+  }));
 
   // world-space layers
   private marks: HTMLCanvasElement;
@@ -55,6 +59,10 @@ export class Canvas2DRenderer extends BaseRenderer {
   // cached paint
   private bodyGrad = new Map<number, CanvasGradient>();
   private beamGrad: CanvasGradient | null = null;
+  /** The backdrop, which changes only with the window. Building a radial
+   *  gradient every frame is the cost this file already avoids elsewhere. */
+  private skyGrad: CanvasGradient | null = null;
+  private skySize = '';
 
   private lastMarkFade = 0;
 
@@ -270,10 +278,13 @@ export class Canvas2DRenderer extends BaseRenderer {
 
   private drawBackdrop(w: number, h: number) {
     const ctx = this.ctx;
-    const g = ctx.createRadialGradient(w / 2, h * 0.42, 40, w / 2, h * 0.5, Math.max(w, h) * 0.78);
-    g.addColorStop(0, '#0b1220');
-    g.addColorStop(1, '#04060b');
-    ctx.fillStyle = g;
+    if (this.skySize !== `${w}x${h}`) {
+      this.skySize = `${w}x${h}`;
+      this.skyGrad = ctx.createRadialGradient(w / 2, h * 0.42, 40, w / 2, h * 0.5, Math.max(w, h) * 0.78);
+      this.skyGrad.addColorStop(0, '#0b1220');
+      this.skyGrad.addColorStop(1, '#04060b');
+    }
+    ctx.fillStyle = this.skyGrad!;
     ctx.fillRect(0, 0, w, h);
 
     // World-locked grid, so motion reads even off the racing surface. Drawn
@@ -327,13 +338,10 @@ export class Canvas2DRenderer extends BaseRenderer {
     ctx.setLineDash([]);
 
     // Neon barriers, glowing by stacked stroke rather than by shadow.
-    for (const [path, rgb] of [
-      [this.edgeL, '56,232,255'],
-      [this.edgeR, '255,77,157'],
-    ] as const) {
-      for (const [width, alpha] of EDGE_GLOW) {
+    for (const { path, strokes } of this.edges) {
+      for (const { width, style } of strokes) {
         ctx.lineWidth = width;
-        ctx.strokeStyle = `rgba(${rgb},${alpha})`;
+        ctx.strokeStyle = style;
         ctx.stroke(path);
       }
     }
@@ -376,12 +384,7 @@ export class Canvas2DRenderer extends BaseRenderer {
 
     // Wheels.
     ctx.fillStyle = '#0b0d12';
-    for (const [wx, wy, turn] of [
-      [1.28, 0.92, 1],
-      [1.28, -0.92, 1],
-      [-1.32, 0.95, 0],
-      [-1.32, -0.95, 0],
-    ] as const) {
+    for (const [wx, wy, turn] of WHEELS) {
       ctx.save();
       ctx.translate(wx, wy);
       if (turn) ctx.rotate(c.steer);
@@ -507,15 +510,15 @@ export class Canvas2DRenderer extends BaseRenderer {
     ctx.save();
     ctx.font = '600 11px ui-monospace, "SF Mono", Menlo, monospace';
     ctx.textAlign = 'center';
+    // Same transform the world layer uses -- translate, flip Y, then rotate --
+    // collapsed into one step, so a plate stays pinned to its car once the
+    // camera is turning.
+    const cos = Math.cos(this.camRot);
+    const sin = Math.sin(this.camRot);
     for (const c of cars) {
       if (c.isLocal) continue;
-      // Same transform the world layer uses -- translate, flip Y, then rotate
-      // -- collapsed into one step, so a plate stays pinned to its car once
-      // the camera is turning.
       const dx = c.x - this.camX;
       const dy = c.y - this.camY;
-      const cos = Math.cos(this.camRot);
-      const sin = Math.sin(this.camRot);
       const px = (dx * cos + dy * sin) * this.camZoom + w / 2 + sx;
       const py = (dx * sin - dy * cos) * this.camZoom + h / 2 + sy;
       if (px < -80 || px > w + 80 || py < -60 || py > h + 60) continue;

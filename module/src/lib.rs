@@ -3,9 +3,10 @@
 //! Note what is *not* here: there is no simulation, no integrator, no collision
 //! code, not even a track. The module is three things and nothing more:
 //!
-//! * an **inbox** -- clients write their controller state into [`input`];
+//! * an **inbox** -- clients write their controller state into [`input`], which
+//!   only the authority can read back;
 //! * a **registry** -- who is connected, which car is theirs, who is allowed to
-//!   be the authority;
+//!   be the authority and which process holds it;
 //! * an **outbox** -- the sidecar writes authoritative poses into [`car_state`]
 //!   and SpacetimeDB fans them out to every subscriber.
 //!
@@ -15,11 +16,23 @@
 //! runs in a process that can be scaled, profiled and hot-restarted separately
 //! from the database.
 
-use spacetimedb::{reducer, table, Identity, ReducerContext, Table, Timestamp};
+use spacetimedb::{reducer, table, ConnectionId, Identity, ReducerContext, Table, Timestamp};
 
 /// Physics world slots. Must match `physics::MAX_CARS`; the sidecar refuses to
 /// start if [`config`] disagrees with the crate it was built against.
 const MAX_CARS: u32 = 24;
+
+/// How long an authority may go quiet before its seat is declared free.
+/// Snapshots land twenty times a second, so this is forty missed ones: long
+/// enough that a stutter is not a handover, short enough that a wedged process
+/// is not a frozen race.
+const LEASE_MICROS: i64 = 2_000_000;
+
+/// Controller writes a client may sustain, and the burst it may bank.
+/// The browser sends thirty a second; the slack absorbs a hiccup that arrives
+/// as a clump without letting anyone hold this reducer open at a kilohertz.
+const INPUT_RATE_HZ: f32 = 45.0;
+const INPUT_BURST: f32 = 15.0;
 
 // ---------------------------------------------------------------- registry --
 
@@ -27,7 +40,7 @@ const MAX_CARS: u32 = 24;
 pub struct Config {
     #[primary_key]
     pub id: u32,
-    /// Identity allowed to call [`push_states`]. Empty until a sidecar claims it.
+    /// Identity currently holding the authority. Empty when nobody does.
     pub sidecar: Option<Identity>,
     pub sidecar_online: bool,
     pub tick_hz: u32,
@@ -47,6 +60,22 @@ pub struct Config {
     /// against" rather than as a mismatch.
     #[default(0)]
     pub physics_fingerprint: u32,
+    /// The only identity allowed to be the authority: whoever published the
+    /// module. Pinned by [`init`], because a database's owner is the one thing
+    /// here that is not first-come. `None` on a database created before this
+    /// column existed, where the first claim pins it instead.
+    #[default(None)]
+    pub owner: Option<Identity>,
+    /// Which *connection* holds the authority right now.
+    ///
+    /// Not the identity: a standby runs on the same credentials as the
+    /// authority it is standing by for, so the identity cannot tell the two
+    /// apart. The connection can, which makes this the fencing token --
+    /// [`push_states`] checks it, so a sidecar that was replaced while it was
+    /// partitioned has its writes refused the moment it comes back, instead of
+    /// scribbling over a race it no longer runs.
+    #[default(None)]
+    pub holder: Option<ConnectionId>,
 }
 
 #[table(accessor = player, public)]
@@ -83,7 +112,13 @@ pub struct Car {
 
 /// What a client is doing with the controls right now. This is the *only* thing
 /// a player is trusted to assert.
-#[table(accessor = input, public)]
+///
+/// Deliberately **not** `public`. SpacetimeDB shows a private table to the
+/// database's owner and to nobody else, which is exactly the split this needs:
+/// the sidecar authenticates as the owner and subscribes to every row, while a
+/// player -- who has no business reading a rival's throttle a few milliseconds
+/// before it takes effect -- is told the table does not exist.
+#[table(accessor = input)]
 pub struct Input {
     #[primary_key]
     pub identity: Identity,
@@ -99,13 +134,20 @@ pub struct Input {
     pub handbrake: bool,
     /// Bumped by [`request_respawn`]; the sidecar acts on the change.
     pub respawn_seq: u32,
+    /// When the last accepted write landed. Half of the rate limiter's state.
     pub at: Timestamp,
+    /// The other half: writes banked but not spent. See [`spend`].
+    #[default(0.0)]
+    pub credits: f32,
 }
 
 // ------------------------------------------------------------------ outbox --
 
-/// Authoritative pose. Written only by the sidecar.
+/// Authoritative pose. Written only by the sidecar, and the payload
+/// [`push_states`] carries: the sidecar sends whole rows, so there is no
+/// second copy of this shape to be kept in step with it.
 #[table(accessor = car_state, public)]
+#[derive(Default)]
 pub struct CarState {
     #[primary_key]
     pub car_id: u32,
@@ -144,34 +186,6 @@ pub struct CarState {
     pub wall: bool,
 }
 
-/// One car's pose inside a [`push_states`] batch.
-#[derive(spacetimedb::SpacetimeType, Clone)]
-pub struct StateUpdate {
-    pub car_id: u32,
-    pub ack_seq: u32,
-    pub x: f32,
-    pub y: f32,
-    pub heading: f32,
-    pub vx: f32,
-    pub vy: f32,
-    pub omega: f32,
-    pub steer: f32,
-    pub ax: f32,
-    pub wheel_spin: f32,
-    pub rpm: f32,
-    pub gear: u8,
-    pub lap: u32,
-    pub cp: u32,
-    pub s: f32,
-    pub lat: f32,
-    pub seg: u32,
-    pub lap_start: f32,
-    pub last_lap: f32,
-    pub best_lap: f32,
-    pub impact: f32,
-    pub wall: bool,
-}
-
 /// Best laps. Aggregating these is bookkeeping, not simulation, so it belongs
 /// in the database rather than the sidecar.
 #[table(accessor = lap_record, public)]
@@ -197,8 +211,15 @@ pub fn init(ctx: &ReducerContext) {
         server_tick: 0,
         updated_at: ctx.timestamp,
         physics_fingerprint: 0,
+        // `init` runs as the identity that published the module, so this is
+        // the one place the owner can be learned without being told.
+        owner: Some(ctx.sender()),
+        holder: None,
     });
-    log::info!("physics-sidecar module initialized, {MAX_CARS} car slots");
+    log::info!(
+        "physics-sidecar module initialized, {MAX_CARS} car slots, owner {}",
+        ctx.sender()
+    );
 }
 
 #[reducer(client_connected)]
@@ -222,62 +243,91 @@ pub fn client_connected(ctx: &ReducerContext) {
 pub fn client_disconnected(ctx: &ReducerContext) {
     let id = ctx.sender();
 
-    // If the authority dropped, say so loudly: clients switch to dead reckoning
-    // and stop trusting their own prediction.
+    // If the authority dropped, free the seat immediately: a standby takes it
+    // on its next tick, and clients switch to dead reckoning until it does.
+    // Matched on the connection, so the authority losing its socket is not
+    // confused with a standby on the same credentials losing its.
     let mut cfg = config(ctx);
-    if cfg.sidecar == Some(id) {
+    if cfg.holder.is_some() && cfg.holder == ctx.connection_id() {
+        cfg.sidecar = None;
+        cfg.holder = None;
         cfg.sidecar_online = false;
         cfg.updated_at = ctx.timestamp;
         ctx.db.config().id().update(cfg);
         log::warn!("sidecar disconnected -- no authority");
     }
 
-    if let Some(mut p) = ctx.db.player().identity().find(&id) {
-        p.online = false;
-        let car_id = p.car_id;
-        p.car_id = 0;
-        ctx.db.player().identity().update(p);
-        remove_car(ctx, car_id);
-    }
-    ctx.db.input().identity().delete(&id);
+    unseat(ctx, id, false);
 }
 
 // ------------------------------------------------------------- authority ----
 
 /// Claim the right to publish authoritative state.
 ///
-/// First caller wins. A second sidecar can only take over once the first has
-/// disconnected, which makes a restart seamless but blocks a rogue client from
-/// stealing the simulation out from under a live one.
+/// Two questions, and they are different ones. *May* you be the authority: only
+/// the identity that published the module, so a player cannot appoint itself
+/// during a handover. *Can* you have it right now: only if the seat is empty,
+/// already yours, or its holder has gone quiet for [`LEASE_MICROS`].
+///
+/// That last clause is the arbitration. Two sidecars on the same credentials --
+/// an authority and the standby waiting to replace it -- both pass the identity
+/// check, and the database is the only thing that sees both of them, so it is
+/// where the tie is broken: whoever's claim commits first becomes the holder,
+/// and the loser reads the row and stands by. A partitioned authority does not
+/// get a vote, and its writes stop counting the moment it stops holding
+/// [`Config::holder`].
 ///
 /// `physics_fingerprint` is what the incoming authority's simulation computes.
-/// The module does not check it -- it has no physics to check it against, which
-/// is the entire point of the sidecar -- it just publishes it so that every
-/// client can check its own copy against the one now deciding the race.
+/// The module does not check it, having no physics to check it against, which
+/// is the entire point. It just publishes it, so every client can check its own
+/// copy against the one now deciding the race.
 #[reducer]
 pub fn claim_authority(ctx: &ReducerContext, physics_fingerprint: u32) -> Result<(), String> {
     let mut cfg = config(ctx);
-    match cfg.sidecar {
-        Some(existing) if existing != ctx.sender() && cfg.sidecar_online => {
-            return Err("another sidecar already holds authority".into());
+    let me = ctx
+        .connection_id()
+        .ok_or("authority must be claimed over a live connection")?;
+
+    match cfg.owner {
+        Some(owner) if owner != ctx.sender() => return Err("not the database owner".into()),
+        Some(_) => {}
+        // A database that predates the column has nobody pinned; the first
+        // claim pins it. Loud, because on a fresh database this never happens.
+        None => {
+            log::warn!("no owner recorded; pinning authority to {}", ctx.sender());
+            cfg.owner = Some(ctx.sender());
         }
-        _ => {}
     }
+
+    if let Some(held) = cfg.holder {
+        let quiet = ctx.timestamp.to_micros_since_unix_epoch()
+            - cfg.updated_at.to_micros_since_unix_epoch();
+        if held != me && quiet < LEASE_MICROS {
+            return Err("another sidecar holds the lease".into());
+        }
+        if held != me {
+            log::warn!("lease expired after {quiet} us; taking authority from {held}");
+        }
+    }
+
     cfg.sidecar = Some(ctx.sender());
+    cfg.holder = Some(me);
     cfg.sidecar_online = true;
     cfg.physics_fingerprint = physics_fingerprint;
     cfg.updated_at = ctx.timestamp;
     ctx.db.config().id().update(cfg);
     // Bot cars are deliberately left alone. The incoming sidecar adopts them
     // from their last published pose and reconciles the count itself, so a
-    // restart does not reset the race.
-    log::info!("authority claimed by {}", ctx.sender());
+    // handover does not reset the race.
+    log::info!("authority claimed by {} on {me}", ctx.sender());
     Ok(())
 }
 
 #[reducer]
 pub fn release_authority(ctx: &ReducerContext) -> Result<(), String> {
     let mut cfg = require_authority(ctx)?;
+    cfg.sidecar = None;
+    cfg.holder = None;
     cfg.sidecar_online = false;
     cfg.updated_at = ctx.timestamp;
     ctx.db.config().id().update(cfg);
@@ -341,6 +391,7 @@ pub fn join_race(ctx: &ReducerContext, name: String, color: u32) -> Result<(), S
         handbrake: false,
         respawn_seq: 0,
         at: ctx.timestamp,
+        credits: INPUT_BURST,
     });
 
     player.name = display;
@@ -351,14 +402,7 @@ pub fn join_race(ctx: &ReducerContext, name: String, color: u32) -> Result<(), S
 
 #[reducer]
 pub fn leave_race(ctx: &ReducerContext) {
-    let id = ctx.sender();
-    if let Some(mut p) = ctx.db.player().identity().find(&id) {
-        let car_id = p.car_id;
-        p.car_id = 0;
-        ctx.db.player().identity().update(p);
-        remove_car(ctx, car_id);
-    }
-    ctx.db.input().identity().delete(&id);
+    unseat(ctx, ctx.sender(), true);
 }
 
 /// The hot path from the client's side: one row, overwritten ~30 times a second.
@@ -379,13 +423,18 @@ pub fn set_input(
     if seq <= row.seq && row.seq != 0 {
         return Ok(());
     }
+    // Nothing stops a client sending faster than the thirty a second the
+    // browser sends at. Dropping the excess silently keeps a flood costing its
+    // sender a reducer call and everyone else nothing.
+    if !spend(&mut row, ctx.timestamp) {
+        return Ok(());
+    }
     row.seq = seq;
     row.tick = tick;
     row.throttle = clamp(throttle, -1.0, 1.0);
     row.steer = clamp(steer, -1.0, 1.0);
     row.brake = clamp(brake, 0.0, 1.0);
     row.handbrake = handbrake;
-    row.at = ctx.timestamp;
     ctx.db.input().identity().update(row);
     Ok(())
 }
@@ -394,8 +443,10 @@ pub fn set_input(
 pub fn request_respawn(ctx: &ReducerContext) -> Result<(), String> {
     let id = ctx.sender();
     let mut row = ctx.db.input().identity().find(&id).ok_or("not racing")?;
+    if !spend(&mut row, ctx.timestamp) {
+        return Ok(());
+    }
     row.respawn_seq = row.respawn_seq.wrapping_add(1);
-    row.at = ctx.timestamp;
     ctx.db.input().identity().update(row);
     Ok(())
 }
@@ -403,47 +454,28 @@ pub fn request_respawn(ctx: &ReducerContext) -> Result<(), String> {
 // ------------------------------------------------------- authority writes ---
 
 /// The sidecar's snapshot. One transaction, every car, ~20 times a second.
+///
+/// Also the authority's heartbeat: `updated_at` is what [`claim_authority`]
+/// measures the lease against, so an authority that is still publishing can
+/// never be displaced, and one that has stopped always is.
 #[reducer]
-pub fn push_states(ctx: &ReducerContext, tick: u64, states: Vec<StateUpdate>) -> Result<(), String> {
+pub fn push_states(ctx: &ReducerContext, tick: u64, states: Vec<CarState>) -> Result<(), String> {
     let mut cfg = require_authority(ctx)?;
 
-    for s in &states {
-        let Some(existing) = ctx.db.car_state().car_id().find(&s.car_id) else {
+    for s in states {
+        let Some(old) = ctx.db.car_state().car_id().find(&s.car_id) else {
             continue; // car left between the sidecar's read and this write
         };
-        if existing.tick > tick {
+        if old.tick > tick {
             continue; // out-of-order snapshot
         }
-        let improved = s.best_lap > 0.0 && (existing.best_lap <= 0.0 || s.best_lap < existing.best_lap);
-        ctx.db.car_state().car_id().update(CarState {
-            car_id: s.car_id,
-            slot: existing.slot,
-            tick,
-            ack_seq: s.ack_seq,
-            x: s.x,
-            y: s.y,
-            heading: s.heading,
-            vx: s.vx,
-            vy: s.vy,
-            omega: s.omega,
-            steer: s.steer,
-            ax: s.ax,
-            wheel_spin: s.wheel_spin,
-            rpm: s.rpm,
-            gear: s.gear,
-            lap: s.lap,
-            cp: s.cp,
-            s: s.s,
-            lat: s.lat,
-            seg: s.seg,
-            lap_start: s.lap_start,
-            last_lap: s.last_lap,
-            best_lap: s.best_lap,
-            impact: s.impact,
-            wall: s.wall,
-        });
-        if improved {
-            record_lap(ctx, s.car_id, s.best_lap);
+        let (car_id, lap) = (s.car_id, s.best_lap);
+        // Which slot a car holds and which tick a pose is from are the
+        // module's to say, not the sidecar's; everything else is the physics.
+        let row = CarState { slot: old.slot, tick, ..s };
+        ctx.db.car_state().car_id().update(row);
+        if lap > 0.0 && (old.best_lap <= 0.0 || lap < old.best_lap) {
+            record_lap(ctx, car_id, lap);
         }
     }
 
@@ -494,13 +526,35 @@ fn config(ctx: &ReducerContext) -> Config {
         .expect("config row missing; module was not initialized")
 }
 
+/// The fence. Holding the right identity is not enough -- a sidecar that was
+/// replaced while it was away still has it -- so what is checked is the
+/// connection recorded by the winning [`claim_authority`].
 fn require_authority(ctx: &ReducerContext) -> Result<Config, String> {
     let cfg = config(ctx);
-    if cfg.sidecar == Some(ctx.sender()) {
+    if cfg.holder.is_some() && cfg.holder == ctx.connection_id() {
         Ok(cfg)
     } else {
-        Err("only the registered sidecar may write simulation state".into())
+        Err("only the sidecar holding the authority lease may write simulation state".into())
     }
+}
+
+/// Take one write out of a client's token bucket, or refuse it.
+///
+/// `credits` is what was left after the last accepted write and `at` is when
+/// that was, so the bucket refills by itself: nothing has to run on a timer,
+/// and a client that goes quiet banks up to [`INPUT_BURST`]. One that floods
+/// runs dry and is dropped here -- before the row is written, and so before
+/// every subscriber pays for the fan-out, which is the cost worth avoiding.
+fn spend(row: &mut Input, now: Timestamp) -> bool {
+    let elapsed =
+        (now.to_micros_since_unix_epoch() - row.at.to_micros_since_unix_epoch()).max(0) as f32;
+    let credits = (row.credits + elapsed * 1e-6 * INPUT_RATE_HZ).min(INPUT_BURST);
+    if credits < 1.0 {
+        return false;
+    }
+    row.credits = credits - 1.0;
+    row.at = now;
+    true
 }
 
 /// Lowest unused physics slot.
@@ -515,33 +569,20 @@ fn free_slot(ctx: &ReducerContext) -> Option<u32> {
 }
 
 fn blank_state(car_id: u32, slot: u32) -> CarState {
-    CarState {
-        car_id,
-        slot,
-        tick: 0,
-        ack_seq: 0,
-        x: 0.0,
-        y: 0.0,
-        heading: 0.0,
-        vx: 0.0,
-        vy: 0.0,
-        omega: 0.0,
-        steer: 0.0,
-        ax: 0.0,
-        wheel_spin: 0.0,
-        rpm: 0.0,
-        gear: 1,
-        lap: 0,
-        cp: 0,
-        s: 0.0,
-        lat: 0.0,
-        seg: 0,
-        lap_start: 0.0,
-        last_lap: 0.0,
-        best_lap: 0.0,
-        impact: 0.0,
-        wall: false,
+    CarState { car_id, slot, gear: 1, ..Default::default() }
+}
+
+/// Take a player off the grid: the car, its pose and its input row all go.
+/// Whoever is leaving is still connected; whoever dropped is not.
+fn unseat(ctx: &ReducerContext, id: Identity, online: bool) {
+    if let Some(mut p) = ctx.db.player().identity().find(&id) {
+        let car_id = p.car_id;
+        p.car_id = 0;
+        p.online = online;
+        ctx.db.player().identity().update(p);
+        remove_car(ctx, car_id);
     }
+    ctx.db.input().identity().delete(&id);
 }
 
 fn remove_car(ctx: &ReducerContext, car_id: u32) {
@@ -588,14 +629,7 @@ fn sanitize_name(raw: &str, fallback: &str) -> String {
     }
 }
 
+/// `f32::clamp` with an answer for NaN, which a client is free to send.
 fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
-    if v.is_nan() {
-        0.0
-    } else if v < lo {
-        lo
-    } else if v > hi {
-        hi
-    } else {
-        v
-    }
+    if v.is_nan() { 0.0 } else { v.clamp(lo, hi) }
 }

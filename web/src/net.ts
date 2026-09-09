@@ -5,9 +5,13 @@
 // reading. That is the whole trust boundary.
 
 import { DbConnection, type EventContext } from './module_bindings';
-import type { Car as CarRow, CarState as CarStateRow } from './module_bindings/types';
+import type {
+  Car as CarRow,
+  CarState as CarStateRow,
+  Config as ConfigRow,
+} from './module_bindings/types';
 import { Identity } from 'spacetimedb';
-import { F } from './sim';
+import { F, wrapPi } from './sim';
 
 export interface Snapshot {
   tick: number;
@@ -16,6 +20,19 @@ export interface Snapshot {
   ackSeq: number;
   /** performance.now() when this landed, for latency estimation. */
   received: number;
+}
+
+/** Everything known about one car this client does not simulate. */
+interface Remote {
+  /** Authoritative poses, oldest first. */
+  snaps: Snapshot[];
+  /** Where the last snapshot said this car was, minus where this client had
+   *  guessed: carried as a fading offset so a correction is never a jump. */
+  offX: number;
+  offY: number;
+  offH: number;
+  /** `performance.now()` the offset was set, which is when it starts fading. */
+  offAt: number;
 }
 
 export interface CarMeta {
@@ -45,6 +62,15 @@ export interface NetSim {
 }
 
 const SNAPSHOT_BUFFER = 40;
+
+/** Longest a remote car is carried forward from its newest snapshot, seconds.
+ *  Past this the guess is worse than the lag it is hiding. */
+const MAX_LEAD = 0.3;
+/** Time constant for fading out a remote car's prediction error. */
+const RESIDUAL_FADE = 0.1;
+/** A correction bigger than this is a teleport -- a respawn, a resync -- and
+ *  gets shown as one instead of slid into place over a tenth of a second. */
+const RESIDUAL_SNAP = 4;
 
 /** Reconnect backoff: first retry, and the ceiling it doubles up to. */
 const RECONNECT_BASE_MS = 700;
@@ -86,8 +112,11 @@ export class Net {
 
   /** car_id -> metadata. */
   cars = new Map<number, CarMeta>();
-  /** car_id -> recent authoritative poses, oldest first. */
-  buffers = new Map<number, Snapshot[]>();
+  /** car_id -> the poses and prediction state for a car this client watches. */
+  remotes = new Map<number, Remote>();
+  /** The tick this client is currently simulating and drawing, which is what
+   *  remote cars are predicted to. Written once a frame by the render loop. */
+  viewTick = 0;
   myCarId = 0;
   mySlot = -1;
 
@@ -102,8 +131,6 @@ export class Net {
   private clockOffset = 0;
   private clockLocked = false;
   sidecarOnline = false;
-  tickHz = 60;
-  snapshotHz = 20;
   /** Fingerprint of the physics the current authority is running, or 0 before
    *  any sidecar has claimed. */
   physicsFingerprint = 0;
@@ -249,7 +276,7 @@ export class Net {
     this.connected = false;
     this.subscribed = false;
     this.cars.clear();
-    this.buffers.clear();
+    this.remotes.clear();
     this.myCarId = 0;
     this.mySlot = -1;
     this.sentAt.clear();
@@ -343,7 +370,7 @@ export class Net {
     db.car.onDelete((_ctx, row) => {
       if (!live()) return;
       this.cars.delete(row.carId);
-      this.buffers.delete(row.carId);
+      this.remotes.delete(row.carId);
       if (row.carId === this.myCarId) {
         this.myCarId = 0;
         this.mySlot = -1;
@@ -387,17 +414,9 @@ export class Net {
       ]);
   }
 
-  private onConfig(row: {
-    sidecarOnline: boolean;
-    serverTick: bigint;
-    tickHz: number;
-    snapshotHz: number;
-    physicsFingerprint: number;
-  }) {
+  private onConfig(row: ConfigRow) {
     this.sidecarOnline = row.sidecarOnline;
     this.serverTick = Number(row.serverTick);
-    this.tickHz = row.tickHz;
-    this.snapshotHz = row.snapshotHz;
     this.physicsFingerprint = row.physicsFingerprint >>> 0;
     this.onConfigChanged?.();
   }
@@ -422,42 +441,31 @@ export class Net {
   /**
    * Turn a row into the exact 24-float record the wasm simulation uses.
    *
-   * Every field the integrator reads back is on the wire; the two that are not
-   * (`slip_f`/`slip_r`) are overwritten before they are ever read, so
-   * reconstructing them as zero is exact rather than approximate.
+   * Positional, in `F` order -- the same `#[repr(C)]` layout the sim maps over
+   * wasm memory. The two fields not on the wire (`slip_f`, `slip_r`) are
+   * overwritten before they are ever read, so reconstructing them as zero is
+   * exact rather than approximate.
    */
   private toRecord(row: CarStateRow): Float32Array {
-    const s = new Float32Array(24);
-    s[F.x] = row.x;
-    s[F.y] = row.y;
-    s[F.heading] = row.heading;
-    s[F.vx] = row.vx;
-    s[F.vy] = row.vy;
-    s[F.omega] = row.omega;
-    s[F.steer] = row.steer;
-    s[F.ax] = row.ax;
-    s[F.slipF] = 0;
-    s[F.slipR] = 0;
-    s[F.wheelSpin] = row.wheelSpin;
-    s[F.rpm] = row.rpm;
-    s[F.gear] = row.gear;
-    s[F.s] = row.s;
-    s[F.lat] = row.lat;
-    s[F.seg] = row.seg;
-    s[F.lap] = row.lap;
-    s[F.cp] = row.cp;
-    s[F.lapStart] = row.lapStart;
-    s[F.lastLap] = row.lastLap;
-    s[F.bestLap] = row.bestLap;
-    s[F.impact] = row.impact;
-    s[F.wall] = row.wall ? 1 : 0;
-    s[F.active] = 1;
-    return s;
+    return Float32Array.of(
+      row.x, row.y, row.heading, row.vx, row.vy, row.omega, row.steer, row.ax,
+      0, 0, row.wheelSpin, row.rpm, row.gear, row.s, row.lat, row.seg,
+      row.lap, row.cp, row.lapStart, row.lastLap, row.bestLap, row.impact,
+      row.wall ? 1 : 0, 1,
+    );
   }
 
   private onState(row: CarStateRow) {
     const tick = Number(row.tick);
     if (tick === 0) return; // placeholder inserted at join
+
+    let r = this.remotes.get(row.carId);
+    if (!r) {
+      r = { snaps: [], offX: 0, offY: 0, offH: 0, offAt: 0 };
+      this.remotes.set(row.carId, r);
+    }
+    const buf = r.snaps;
+    if (buf.length && tick <= buf[buf.length - 1].tick) return; // stale
 
     const snap: Snapshot = {
       tick,
@@ -465,13 +473,13 @@ export class Net {
       ackSeq: row.ackSeq,
       received: performance.now(),
     };
-
-    let buf = this.buffers.get(row.carId);
-    if (!buf) {
-      buf = [];
-      this.buffers.set(row.carId, buf);
+    // Where this car was about to be drawn, before the news arrived.
+    const at = this.viewTick;
+    let guessed: [number, number, number] | null = null;
+    if (at > 0 && buf.length > 0) {
+      const p = this.predict(r, at);
+      guessed = [p[F.x], p[F.y], p[F.heading]];
     }
-    if (buf.length && tick <= buf[buf.length - 1].tick) return; // stale
     buf.push(snap);
     if (tick > this.lastSnapTick) {
       this.lastSnapTick = tick;
@@ -479,6 +487,7 @@ export class Net {
       this.syncClock(tick, snap.received);
     }
     while (buf.length > SNAPSHOT_BUFFER) buf.shift();
+    if (guessed) this.absorb(r, guessed, at, snap.received);
 
     if (row.carId === this.myCarId) {
       const sent = this.sentAt.get(row.ackSeq);
@@ -486,7 +495,13 @@ export class Net {
         const rtt = snap.received - sent;
         // Exponential average; the raw figure is noisy at 20 Hz.
         this.rttMs = this.rttMs === 0 ? rtt : this.rttMs * 0.85 + rtt * 0.15;
-        for (const k of this.sentAt.keys()) if (k <= row.ackSeq) this.sentAt.delete(k);
+        // Sequence numbers only go up and a Map iterates in insertion order,
+        // so the first key past the ack ends the sweep -- the whole 512-entry
+        // window was being walked to drop the one or two that were acked.
+        for (const k of this.sentAt.keys()) {
+          if (k > row.ackSeq) break;
+          this.sentAt.delete(k);
+        }
       }
       this.onLocalSnapshot?.(snap);
     }
@@ -581,21 +596,88 @@ export class Net {
     return this.clockOffset + (now / 1000) * 60;
   }
 
-  /** Interpolated pose for a remote car at a fractional server tick. */
+  /** The newest authoritative pose for a car, or null. Not predicted: this is
+   *  the authority's own word, which is what the ghost marker draws. */
+  authoritative(carId: number): Float32Array | null {
+    const r = this.remotes.get(carId);
+    return r && r.snaps.length ? r.snaps[r.snaps.length - 1].state : null;
+  }
+
+  /**
+   * Where a remote car is at `atTick`, on this client's clock.
+   *
+   * Not "where it was 70 ms ago", which is what an interpolation buffer would
+   * give you. The local car is predicted several ticks
+   * into the *future* -- far enough ahead that its input arrives before the
+   * authority needs it -- so a rival drawn from the past is a rival in the
+   * wrong place: metres behind where the authority will resolve the contact,
+   * at racing speed. Carrying the newest snapshot forward to the tick actually
+   * being simulated puts every car on one clock, and it is the clock the
+   * authority used. What it costs is a guess, and [`absorb`] fades away the
+   * difference between the guess and the snapshot that settles it.
+   */
+  predictRemote(carId: number, atTick: number): Float32Array | null {
+    const r = this.remotes.get(carId);
+    if (!r || r.snaps.length === 0) return null;
+    return this.predict(r, atTick);
+  }
+
+  /**
+   * The same pose with the last correction still fading out of it: what to
+   * *draw*. The physics gets [`predictRemote`] instead, because the residual is
+   * an apology for a guess that has already been corrected, and re-introducing
+   * it would only make the next collision disagree with the authority again.
+   */
   sampleRemote(carId: number, atTick: number): Float32Array | null {
-    const buf = this.buffers.get(carId);
-    if (!buf || buf.length === 0) return null;
-    if (buf.length === 1 || atTick <= buf[0].tick) return buf[0].state;
+    const r = this.remotes.get(carId);
+    if (!r || r.snaps.length === 0) return null;
+    const out = this.predict(r, atTick);
+    const age = (performance.now() - r.offAt) / 1000;
+    if (age < RESIDUAL_FADE * 5) {
+      const k = Math.exp(-age / RESIDUAL_FADE);
+      out[F.x] += r.offX * k;
+      out[F.y] += r.offY * k;
+      out[F.heading] += r.offH * k;
+    }
+    return out;
+  }
+
+  /**
+   * The pose the buffer implies at `atTick`, written into the shared scratch.
+   *
+   * Between snapshots this interpolates. Past the newest one -- which is where
+   * the client normally is, being ahead of the authority -- it carries the car
+   * forward at a constant turn rate: a car mid-corner keeps turning, so
+   * rotating its velocity as it goes follows the arc instead of flying off the
+   * tangent. Over the ten-odd ticks of lead that is the difference between
+   * centimetres of error and half a metre.
+   */
+  private predict(r: Remote, atTick: number): Float32Array {
+    const buf = r.snaps;
+    const out = this.sampleOut;
+    if (buf.length === 1 || atTick <= buf[0].tick) {
+      out.set(buf[0].state);
+      return out;
+    }
 
     const last = buf[buf.length - 1];
     if (atTick >= last.tick) {
-      // Ran out of buffer: dead reckon briefly rather than freeze.
-      const ahead = Math.min((atTick - last.tick) / 60, 0.25);
-      const out = this.sampleOut;
       out.set(last.state);
-      out[F.x] += out[F.vx] * ahead;
-      out[F.y] += out[F.vy] * ahead;
-      out[F.heading] += out[F.omega] * ahead;
+      const dt = Math.min((atTick - last.tick) / 60, MAX_LEAD);
+      const w = out[F.omega];
+      const th = w * dt;
+      const straight = Math.abs(w) < 1e-3;
+      const s = straight ? dt : Math.sin(th) / w;
+      const c = straight ? 0 : (1 - Math.cos(th)) / w;
+      const vx = out[F.vx];
+      const vy = out[F.vy];
+      out[F.x] += vx * s - vy * c;
+      out[F.y] += vx * c + vy * s;
+      out[F.heading] += th;
+      const cs = Math.cos(th);
+      const sn = Math.sin(th);
+      out[F.vx] = vx * cs - vy * sn;
+      out[F.vy] = vx * sn + vy * cs;
       return out;
     }
 
@@ -604,10 +686,32 @@ export class Net {
       const a = buf[i - 1];
       if (atTick >= a.tick && atTick <= b.tick) {
         const t = (atTick - a.tick) / Math.max(1, b.tick - a.tick);
-        return lerpState(this.sampleOut, a.state, b.state, t);
+        return lerpState(out, a.state, b.state, t);
       }
     }
-    return buf[0].state;
+    out.set(buf[0].state);
+    return out;
+  }
+
+  /**
+   * Keep the error a new snapshot reveals, rather than showing it.
+   *
+   * The same trick the local car plays after a rollback: the correction is
+   * subtracted from where the car is drawn and decays to nothing over
+   * [`RESIDUAL_FADE`], so twenty snapshots a second land as a steady pose
+   * instead of a shudder. Whatever is still fading is folded into the new
+   * offset, so a run of small corrections does not restart the fade each time.
+   */
+  private absorb(r: Remote, guessed: [number, number, number], at: number, now: number) {
+    const p = this.predict(r, at);
+    const k = Math.exp(-(now - r.offAt) / 1000 / RESIDUAL_FADE);
+    r.offX = r.offX * k + (guessed[0] - p[F.x]);
+    r.offY = r.offY * k + (guessed[1] - p[F.y]);
+    r.offH = r.offH * k + wrapPi(guessed[2] - p[F.heading]);
+    r.offAt = now;
+    if (Math.abs(r.offX) > RESIDUAL_SNAP || Math.abs(r.offY) > RESIDUAL_SNAP) {
+      r.offX = r.offY = r.offH = 0;
+    }
   }
 
   /** Best-lap table, quickest first, joined with whoever is on track now.
@@ -636,18 +740,13 @@ export class Net {
   }
 }
 
-function shortAngle(a: number, b: number): number {
-  let d = b - a;
-  while (d > Math.PI) d -= Math.PI * 2;
-  while (d < -Math.PI) d += Math.PI * 2;
-  return d;
-}
+/** Fields that interpolate linearly. Hoisted out of `lerpState`: it runs for
+ *  every remote car on every fixed step. */
+const LERP = [F.x, F.y, F.vx, F.vy, F.omega, F.steer, F.wheelSpin, F.rpm, F.s, F.lat];
 
 function lerpState(out: Float32Array, a: Float32Array, b: Float32Array, t: number): Float32Array {
   out.set(b);
-  for (const f of [F.x, F.y, F.vx, F.vy, F.omega, F.steer, F.wheelSpin, F.rpm, F.s, F.lat]) {
-    out[f] = a[f] + (b[f] - a[f]) * t;
-  }
-  out[F.heading] = a[F.heading] + shortAngle(a[F.heading], b[F.heading]) * t;
+  for (const f of LERP) out[f] = a[f] + (b[f] - a[f]) * t;
+  out[F.heading] = a[F.heading] + wrapPi(b[F.heading] - a[F.heading]) * t;
   return out;
 }

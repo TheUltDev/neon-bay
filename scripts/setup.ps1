@@ -63,9 +63,12 @@ try {
   Invoke-Checked spacetime $publish
 
   Step 'generating client bindings'
-  Invoke-Checked spacetime @('generate', '--lang', 'rust',
+  # `--include-private` only for the sidecar: `input` is a private table, and
+  # the sidecar is the one client allowed to read it. The browser's bindings
+  # are generated without it, so the web bundle does not carry the accessor.
+  Invoke-Checked spacetime @('generate', '--lang', 'rust', '--include-private', '-y',
     '--out-dir', 'sidecar/src/module_bindings', '--module-path', 'module')
-  Invoke-Checked spacetime @('generate', '--lang', 'typescript',
+  Invoke-Checked spacetime @('generate', '--lang', 'typescript', '-y',
     '--out-dir', 'web/src/module_bindings', '--module-path', 'module')
 
   Step 'building the shared physics core (native + wasm)'

@@ -24,6 +24,14 @@ export const EDGE_RGB = [
   [255, 77, 157],
 ] as const;
 
+/** Wheel positions in the car frame, and whether the wheel steers. */
+export const WHEELS = [
+  [1.28, 0.92, 1],
+  [1.28, -0.92, 1],
+  [-1.32, 0.95, 0],
+  [-1.32, -0.95, 0],
+] as const;
+
 /** The car silhouette in its own frame, x forward, in metres. */
 export const CAR_OUTLINE = [
   2.1, -0.62, 1.55, -0.95, -1.65, -0.95, -2.1, -0.66,

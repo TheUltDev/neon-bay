@@ -46,6 +46,10 @@ export abstract class BaseRenderer implements Renderer {
 
   /** Last contact point of each tire, in world space, keyed by wheel id. */
   private contacts = new Map<number, { x: number; y: number; t: number }>();
+  /** The minimap's track outline. 768 samples that never move, so it is built
+   *  once per panel size rather than once a frame. */
+  private miniPath: Path2D | null = null;
+  private miniSize = '';
 
   /** World to mark-layer scale and origin, shared by every backend so a skid
    *  lands in the same texel whichever one is drawing it. */
@@ -282,21 +286,26 @@ export abstract class BaseRenderer implements Renderer {
     const px = (x: number) => ox + x * scale;
     const py = (y: number) => oy - y * scale;
 
-    ctx.beginPath();
-    const { points, samples } = sim.track;
-    for (let i = 0; i <= samples; i++) {
-      const k = i % samples;
-      const x = px(points[k * 2]);
-      const y = py(points[k * 2 + 1]);
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    if (this.miniSize !== `${w}x${h}`) {
+      this.miniSize = `${w}x${h}`;
+      const path = new Path2D();
+      const { points, samples } = sim.track;
+      for (let i = 0; i <= samples; i++) {
+        const k = i % samples;
+        const x = px(points[k * 2]);
+        const y = py(points[k * 2 + 1]);
+        i === 0 ? path.moveTo(x, y) : path.lineTo(x, y);
+      }
+      path.closePath();
+      this.miniPath = path;
     }
-    ctx.closePath();
+    const outline = this.miniPath!;
     ctx.strokeStyle = 'rgba(120,190,255,0.32)';
     ctx.lineWidth = Math.max(2.5, sim.track.halfWidth[0] * scale * 1.6);
-    ctx.stroke();
+    ctx.stroke(outline);
     ctx.strokeStyle = 'rgba(56,232,255,0.5)';
     ctx.lineWidth = 1;
-    ctx.stroke();
+    ctx.stroke(outline);
 
     for (const c of cars) {
       ctx.beginPath();
