@@ -62,10 +62,13 @@ RUN cargo build --release -p sidecar \
 FROM clockworklabs/spacetime:${SPACETIME_VERSION}
 
 USER root
-# Storage is ephemeral by design: every boot starts from an empty data directory
-# and republishes. Nothing here outlives a deploy, which is the trade this demo
-# makes -- the durable state is a lap time.
-RUN mkdir -p /stdb && chown spacetime:spacetime /stdb
+# Where the Railway volume gets mounted, and everything that has to outlive a
+# deploy lives under it: the database in `data/`, the keypair identities are
+# signed with in `keys/`, and the CLI's own identity -- the one that owns the
+# database and is therefore the only one allowed to publish to it again -- in
+# `cli.toml`. Three separate things rather than one directory, because the
+# database is the only one it is ever right to throw away.
+RUN mkdir -p /stdb/data && chown -R spacetime:spacetime /stdb
 
 COPY --from=builder --chmod=755 /out/sidecar /usr/local/bin/sidecar
 COPY --from=builder /out/module.wasm /app/module.wasm
@@ -74,7 +77,7 @@ COPY --chmod=755 scripts/railway-start.sh /usr/local/bin/railway-start
 USER spacetime
 WORKDIR /app
 
-ENV STDB_DATA_DIR=/stdb \
+ENV STDB_STATE_DIR=/stdb \
     STDB_DB=physics-sidecar \
     SIDECAR_BOTS=6
 

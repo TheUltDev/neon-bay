@@ -60,6 +60,24 @@ const STALL_MS = 5000;
 /** A dial that has neither connected nor failed by now has hung. */
 const DIAL_TIMEOUT_MS = 15000;
 
+/**
+ * Did this dial fail because the database refused the token we presented?
+ *
+ * Worth telling apart from an unreachable server, because retrying is useless:
+ * every attempt would present the same dead credential and be refused
+ * identically. Tokens are signed with a key the server holds, and a client has
+ * no way to know it has been rotated -- which happens whenever the deployment's
+ * volume is replaced, or the database it is talking to moves somewhere new.
+ * Everyone who has been here before then arrives holding a token signed by a key
+ * that is gone. The browser SDK trades a saved token for a short-lived one
+ * before it opens the socket, so this surfaces as a failed exchange rather than
+ * as a refused connection: no socket is ever attempted, and the dial fails
+ * looking exactly like a server that is down.
+ */
+function isTokenRejected(err: Error | undefined): boolean {
+  return /verify token|unauthoriz|forbidden|\b40[13]\b/i.test(err?.message ?? '');
+}
+
 export class Net {
   conn!: DbConnection;
   identity: Identity | null = null;
@@ -144,10 +162,14 @@ export class Net {
    * The first attempt rejects if it fails, so the page can fall back to the
    * offline view. Every attempt after that is the reconnect loop and never
    * rejects: it queues another try and returns.
+   *
+   * `useSaved` is how the one retry in `fail` comes back around without the
+   * stored token, and the reason that retry cannot loop: the second pass has
+   * no token to have rejected.
    */
-  private open(initial: boolean): Promise<void> {
+  private open(initial: boolean, useSaved = true): Promise<void> {
     const tokenKey = `stdb-sidecar-token:${this.dbName}`;
-    const saved = localStorage.getItem(tokenKey) ?? undefined;
+    const saved = useSaved ? (localStorage.getItem(tokenKey) ?? undefined) : undefined;
     const epoch = ++this.epoch;
     this.dialing = true;
     this.dialingSince = performance.now();
@@ -164,6 +186,20 @@ export class Net {
         if (settled) return;
         settled = true;
         this.dialing = false;
+        // Held a credential the database will not take: forget it and dial
+        // straight back as a stranger. Waiting for the backoff would only
+        // present it again, so the offline screen the player would otherwise
+        // be looking at is permanent -- and a wrong one, since the server is
+        // up and would take them without it.
+        if (saved && isTokenRejected(err)) {
+          try {
+            localStorage.removeItem(tokenKey);
+          } catch {
+            /* private browsing; there was nothing durable to forget */
+          }
+          resolve(this.open(initial, false));
+          return;
+        }
         if (initial) {
           reject(err);
         } else {

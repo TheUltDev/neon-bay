@@ -170,12 +170,46 @@ to `us-east4` at **one replica**. That last part is not a limitation waiting to
 be fixed: `push_states` is guarded by a single registered identity, so a second
 sidecar would be turned away by the module even if Railway ran one.
 
-**Storage is deliberately ephemeral.** No volume is attached, so every deploy
-starts from an empty data directory and the entrypoint republishes into it. Lap
-records and player identities do not survive a push, which is the right trade
-for a demo whose durable state is a lap time. To keep them, attach a Railway
-volume at `/stdb` and set `RAILWAY_RUN_UID=0` -- the image runs as a non-root
-user, and Railway mounts volumes root-owned.
+**Storage persists.** A Railway volume is mounted at `/stdb`, holding three
+separate things: the database in `data/`, the keypair identities are signed with
+in `keys/`, and the CLI's own identity in `cli.toml`. They are separate because
+the database is the only one of the three it is ever right to throw away.
+
+Keeping the database was the easy part. Three things had to be true for keeping
+it to actually mean anything, and all three live in `scripts/railway-start.sh`:
+
+- **The module is published in place**, not recreated. `spacetime publish`
+  without `--delete-data` updates the module and keeps the tables underneath it,
+  and creates the database when the volume is empty, so first boot is not a
+  special case. A module the running database cannot be migrated to is retried
+  once, then recreated from scratch -- losing the data, loudly, because a demo
+  that will not start is worse than a demo that lost its lap times.
+- **The signing keypair lives on the volume**, at `/stdb/keys`, via
+  `--jwt-priv-key-path` and `--jwt-pub-key-path`. SpacetimeDB otherwise keeps it
+  beside the CLI config, which is in the image rather than on the volume, and a
+  keypair that changes every deploy hands every returning player a token signed
+  by a key that is gone. Their records would survive and their claim on them
+  would not.
+- **The CLI's identity lives on the volume too**, at `/stdb/cli.toml`, via
+  `--config-path`. This is the one that bites, because nothing goes wrong until
+  the *second* deploy. A database belongs to the identity that created it and
+  only that identity may publish to it again; the CLI keeps its identity under
+  `$HOME`, which is in the image. Leave it there and deploy two arrives a
+  stranger to the database deploy one created: the pre-publish check answers
+  `403 ... is not authorized to perform action on database`, and the recreate
+  fallback cannot save it either, because resetting a database is also something
+  only its owner may do. The container crashloops with no way to grant itself
+  the rights back, and the only fix is from outside -- delete `data/`, and
+  nothing else.
+
+The volume needs `RAILWAY_RUN_UID=0` alongside it: the image runs as a non-root
+user and Railway mounts volumes root-owned. Set the variable before attaching
+the volume and the deploy in between still comes up.
+
+Clients are not owed a durable database, though, and the one connecting has no
+way to know a key was rotated. So the client treats a refused token as a
+credential to discard rather than a server to give up on -- see
+[The client](#the-client).
 
 Service variables:
 
@@ -219,6 +253,20 @@ point a deployed page at a server on your desk:
 ```
 https://<your-worker>.workers.dev/?uri=http://192.168.1.20:3000
 ```
+
+**A refused token is forgotten, not retried.** The client keeps its identity
+token in `localStorage` and presents it on every dial, and the browser SDK
+trades it for a short-lived one *before* opening the socket -- so a token the
+database will not verify fails the dial outright, looking exactly like a server
+that is down. It is the opposite: the server is up and would take the same
+player without it. `Net.open` tells the two apart and, on a refusal, drops the
+stored token and immediately redials as a stranger. The retry cannot loop,
+because the second pass has no token to have rejected.
+
+Worth having even with the volume attached. A key rotates whenever the volume
+is replaced or a database is deployed somewhere new, and without this the
+reconnect loop re-presents the dead token forever: every returning player is
+told to go start a local database, and no amount of reloading helps.
 
 **Ship the sidecar and `physics.wasm` together.** They are two halves of one
 simulation and they deploy to different places, so it is entirely possible to
