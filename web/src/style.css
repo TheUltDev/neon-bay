@@ -104,6 +104,16 @@ body {
 .stack::-webkit-scrollbar { width: 5px; }
 .stack::-webkit-scrollbar-thumb { background: rgba(120, 170, 220, 0.3); border-radius: 3px; }
 
+/* The other end of a column: panels parked at the bottom as one group, so the
+   space a column has spare opens up between them and the scrolling stack
+   rather than in the middle of them. */
+.stack-end {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  flex: none;
+}
+
 .panel {
   pointer-events: auto;
   background: var(--panel);
@@ -192,6 +202,74 @@ body {
   font-variant-numeric: tabular-nums;
 }
 .lap-line.small b { font-size: 11px; }
+
+/* --- renderer ---
+   The GPU backends draw nameplates on a 2D layer over the stage rather than
+   standing up a glyph atlas for a dozen short strings. It sits under the
+   vignette, exactly where the plates the 2D renderer paints into the canvas
+   would be. */
+.gfx-overlay {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  pointer-events: none;
+}
+
+/* A GPU can have a long name and the column is 268px wide. */
+#gfx-panel .kv label { flex: none; }
+#gfx-panel .kv b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The tier picker: three buttons, the live one lit. Unsupported tiers stay in
+   place rather than disappearing -- which of the three a browser will not give
+   you is part of what this panel is for. */
+.seg {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.seg button {
+  padding: 5px 2px;
+  font-size: 8.5px;
+  letter-spacing: 0.03em;
+  color: var(--dim);
+  background: rgba(120, 170, 220, 0.06);
+  border-color: var(--line);
+}
+.seg button:hover:not(:disabled) {
+  color: var(--text);
+  background: rgba(56, 232, 255, 0.14);
+  border-color: rgba(56, 232, 255, 0.35);
+}
+.seg button.on {
+  color: var(--cyan);
+  background: rgba(56, 232, 255, 0.18);
+  border-color: rgba(56, 232, 255, 0.6);
+  font-weight: 700;
+}
+.seg button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Why we are not on the tier above. Absent, and hidden, when we are. */
+.note {
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  color: var(--dim);
+  font-size: 9.5px;
+  line-height: 1.55;
+}
 
 /* --- netcode --- */
 #errgraph {
@@ -600,7 +678,8 @@ kbd {
   #hud { --col-l: 132px; --col-r: 138px; --gap: 6px; --minimap: 86px; --tacho: 74px; --errgraph: 44px; --leaderboard: 152px; padding: 6px; }
   .panel { padding: 6px 7px; }
   .panel-title { font-size: 8px; letter-spacing: 0.1em; margin-bottom: 6px; padding-bottom: 4px; }
-  #net-panel .kv { padding: 1.5px 0; }
+  #net-panel .kv,
+  #gfx-panel .kv { padding: 1.5px 0; }
   #dash-panel { flex-direction: column; align-items: stretch; gap: 6px; }
   #tacho { align-self: center; }
   .lap-time { font-size: 16px; }
@@ -658,5 +737,11 @@ kbd {
     grid-template-columns: 1fr 1fr;
     align-content: start;
   }
-  #minimap { align-self: start; }
+  /* The pair at the bottom goes side by side for the same reason. */
+  .stack-end {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: end;
+  }
+  #minimap { align-self: end; }
 }

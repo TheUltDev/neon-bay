@@ -21,6 +21,8 @@ export interface HudState {
   authority: 'online' | 'offline' | 'connecting' | 'mismatch';
   /** Rendered frames per second, measured over the last half second. */
   fps: number;
+  /** Which renderer the browser gave us, and what it is drawing into. */
+  gfx: GfxState;
   serverTick: number;
   clientTick: number;
   lead: number;
@@ -46,6 +48,23 @@ export interface HudState {
    *  row is appended out of rank order when you did not make the cut, so the
    *  board can always answer "where am I". */
   leaderboard: LeaderRow[];
+}
+
+export interface GfxState {
+  /** "WebGPU", "WebGL 2", "Canvas 2D". */
+  api: string;
+  /** The GPU, short enough for the panel. */
+  device: string;
+  /** Everything the driver would say, for the tooltip. */
+  detail: string;
+  /** Why this tier and not the one above it, when there is a reason. */
+  fallback: string | null;
+  /** Drawing buffer, in device pixels, and the ratio it came from. */
+  w: number;
+  h: number;
+  dpr: number;
+  /** False on the Canvas2D fallback: the picture is the same, the path is not. */
+  accelerated: boolean;
 }
 
 export interface LeaderRow {
@@ -105,6 +124,25 @@ export class Hud {
     this.el(id).style[prop] = value;
   }
 
+  /** One attribute, written only if it changed. */
+  private attr(id: string, name: string, value: string) {
+    const key = `${id}@${name}`;
+    if (this.painted.get(key) === value) return;
+    this.painted.set(key, value);
+    this.el(id).setAttribute(name, value);
+  }
+
+  /** A line that is there when there is something to say, and gone when not. */
+  private note(id: string, text: string | null) {
+    const key = `${id}.note`;
+    const v = text ?? '';
+    if (this.painted.get(key) === v) return;
+    this.painted.set(key, v);
+    const el = this.el(id);
+    el.textContent = v;
+    el.hidden = v === '';
+  }
+
   pushError(e: number) {
     this.errHistory[this.errHead] = e;
     this.errHead = (this.errHead + 1) % GRAPH_SAMPLES;
@@ -138,6 +176,21 @@ export class Hud {
     this.set('k-servertick', s.serverTick.toLocaleString());
     this.set('k-clienttick', s.clientTick.toLocaleString());
     this.set('k-lead', `${s.lead >= 0 ? '+' : ''}${s.lead} ticks`);
+
+    // --- renderer ---
+    // The dot is green on a GPU backend and amber on the 2D fallback: not a
+    // fault, but the slow path, and worth seeing before reading the frame rate
+    // underneath it.
+    const gdot = `dot ${s.gfx.accelerated ? 'ok' : 'warn'}`;
+    if (this.painted.get('gfx-dot.class') !== gdot) {
+      this.painted.set('gfx-dot.class', gdot);
+      this.el('gfx-dot').className = gdot;
+    }
+    this.set('gfx-api', s.gfx.api);
+    this.set('gfx-device', s.gfx.device);
+    this.attr('gfx-device', 'title', s.gfx.detail);
+    this.set('gfx-res', `${s.gfx.w}×${s.gfx.h}${s.gfx.dpr === 1 ? '' : ` @${trim(s.gfx.dpr)}x`}`);
+    this.note('gfx-note', s.gfx.fallback);
 
     this.set('k-fps', s.fps > 0 ? Math.round(s.fps).toString() : '—');
     // The simulation is fixed-step, so a slow frame rate does not change what
@@ -363,6 +416,11 @@ export class Hud {
       }),
     );
   }
+}
+
+/** A device pixel ratio without the trailing zeroes: 2, 1.5, 1.25. */
+function trim(n: number): string {
+  return n.toFixed(2).replace(/\.?0+$/, '');
 }
 
 export function fmtTime(seconds: number): string {

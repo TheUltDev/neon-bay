@@ -65,7 +65,7 @@ reimplementation: one source of truth for what a car does.
 | `physics/`  | The simulation. Deterministic `f32`, no dependencies. Vehicle dynamics, track, collisions, bot driver, and a bare C-ABI wasm bridge. |
 | `module/`   | The SpacetimeDB module. Tables and reducers only: an inbox for inputs, a registry of who is racing, an outbox for authoritative state. |
 | `sidecar/`  | The authority. A SpacetimeDB client that steps the world at 60 Hz, drives the bots, and publishes snapshots at 20 Hz. |
-| `web/`      | The game. Vite + TypeScript, Canvas2D, no framework. Prediction, rollback, entity interpolation, and a telemetry HUD that shows all of it working. Sound is synthesized in the browser — an engine note and a chiptune soundtrack, no audio files to ship. `public/tech.html` is the architecture write-up served at `/tech`: one standalone file, no build step, linked from the join screen. |
+| `web/`      | The game. Vite + TypeScript, no framework, drawn on WebGPU, WebGL 2 or Canvas2D depending on the browser. Prediction, rollback, entity interpolation, and a telemetry HUD that shows all of it working. Sound is synthesized in the browser — an engine note and a chiptune soundtrack, no audio files to ship. `public/tech.html` is the architecture write-up served at `/tech`: one standalone file, no build step, linked from the join screen. |
 | `scripts/`  | Setup, dev launcher, the native-vs-wasm determinism check, and the container entrypoint. |
 | `Dockerfile` | The database and the sidecar in one image, for [deploying](#deploying-it). `railway.json` and `web/wrangler.toml` are the rest of it. |
 
@@ -248,6 +248,12 @@ is designed to move a number on it.
 - **Watch the server ghost** (the dashed outline). That is the authority's most
   recent published pose, drawn next to your prediction. On a good link it trails
   by exactly the interpolation delay.
+- **Change renderer mid-lap.** The *Renderer* panel names the backend the browser
+  chose, the GPU behind it, and the frame rate -- the one number on the page the
+  client alone answers for. Its three buttons swap tier without a reload, which
+  is the quickest way to watch the same frame come out of WebGPU, WebGL 2 and
+  Canvas2D one after the other. (`?renderer=webgl` pins one from the URL
+  instead.)
 
 ## How the netcode works
 
@@ -369,6 +375,35 @@ pins 1.6 g so it cannot come back.
 
 Nothing to configure for that: `claim_authority` deliberately leaves the bot
 cars alone, and the sidecar reconciles the field to its `--bots` count itself.
+
+## Drawing it
+
+Three renderers, one picture. The client asks for **WebGPU**, falls back to
+**WebGL 2**, and falls back again to the **Canvas2D** renderer this started as.
+The Renderer panel says which one you got and on what hardware, and its three
+buttons change tier in place: no reload, the camera does not move, and a tier
+this browser will not give you is disabled and says why on hover. A canvas only
+ever gets one kind of context, so switching swaps the stage for a fresh canvas
+-- as does a failed attempt on the way down, without which the fallback would be
+hopeful rather than real. `?renderer=` still pins a tier from the URL.
+
+The two GPU tiers are one renderer, not two. `web/src/render/gpu.ts` builds a
+frame's worth of triangles and hands them to a device interface that WebGL 2 and
+WebGPU each implement in about 350 lines of plumbing. The track is triangulated
+once at load into two buffers that never change; everything that moves is
+appended to three more every frame. A full grid of cars comes to eight draw
+calls, where the 2D renderer issues one per car per detail.
+
+Nothing is sorted and there is no depth buffer: triangles land in the order they
+were written, which is the order the 2D renderer paints in. That is the whole
+reason the three agree, down to the stacked strokes that make the barriers glow.
+The one place the APIs genuinely differ -- which end of a render target counts
+as the top, which decides how the skid-mark layer is sampled -- is a single sign
+in a projection.
+
+Text is the exception on both GPU tiers: nameplates go on a 2D canvas over the
+top, because a glyph atlas to draw a dozen short strings would be more machinery
+than the strings are worth.
 
 ## What it costs
 

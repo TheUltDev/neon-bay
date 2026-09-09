@@ -91,13 +91,33 @@
           </section>
         </div>
 
-        <!-- right: the netcode story, the track, the leaderboard -->
+        <!-- right: the netcode story on top, the track and the board below -->
         <div class="hud-col">
           <div class="stack">
+            <!-- Which of the three renderers the browser ended up with, and
+                 what it is drawing into. The frame rate lives here because it
+                 is the one number on the page the client alone answers for. -->
+            <section class="panel" id="gfx-panel">
+              <div class="panel-title">Renderer</div>
+              <div class="row"><span id="gfx-dot" class="dot"></span><span id="gfx-api">choosing…</span></div>
+              <div class="kv"><label>device</label><b id="gfx-device">—</b></div>
+              <div class="kv"><label>resolution</label><b id="gfx-res">—</b></div>
+              <div class="kv"><label>client fps</label><b id="k-fps">—</b></div>
+              <!-- Switches tier in place, no reload: the stage canvas is
+                   replaced, because one canvas only ever gets one kind of
+                   context. A tier this browser cannot give us is disabled and
+                   says why on hover. -->
+              <div class="seg" id="gfx-pick">
+                <button type="button" data-gfx="webgpu">WebGPU</button>
+                <button type="button" data-gfx="webgl2">WebGL 2</button>
+                <button type="button" data-gfx="canvas2d">Canvas 2D</button>
+              </div>
+              <div class="note" id="gfx-note" hidden></div>
+            </section>
+
             <section class="panel" id="net-panel">
               <div class="panel-title">Prediction &amp; reconciliation</div>
               <canvas id="errgraph" width="252" height="62"></canvas>
-              <div class="kv"><label>client fps</label><b id="k-fps">—</b></div>
               <div class="kv"><label>round trip</label><b id="k-rtt">—</b></div>
               <div class="kv"><label>prediction error</label><b id="k-err">0.000 m</b></div>
               <div class="kv"><label>smoothing out</label><b id="k-smooth">0.000 m</b></div>
@@ -108,14 +128,18 @@
               <div class="kv"><label>resyncs</label><b id="k-resync">0</b></div>
             </section>
 
-            <canvas id="minimap" class="panel"></canvas>
           </div>
 
-          <!-- bottom of the column: the leaderboard -->
-          <section class="panel" id="leaderboard-panel">
-            <div class="panel-title">Best laps <span>· kept by the module</span></div>
-            <ol id="leaderboard"></ol>
-          </section>
+          <!-- bottom of the column: where you are on the circuit, and who has
+               been round it quickest. Both are about the track rather than the
+               link, so they sit together and away from the telemetry. -->
+          <div class="stack-end">
+            <canvas id="minimap" class="panel"></canvas>
+            <section class="panel" id="leaderboard-panel">
+              <div class="panel-title">Best laps <span>· kept by the module</span></div>
+              <ol id="leaderboard"></ol>
+            </section>
+          </div>
         </div>
       </div>
 

@@ -1,4 +1,4 @@
-// Canvas2D renderer.
+// Canvas2D renderer: the fallback tier, and the reference the other two match.
 //
 // Everything here is drawn from the same wasm world the netcode maintains, so
 // what you see is literally the simulation state -- including the "server ghost"
@@ -27,65 +27,14 @@
 // clipping the skid layer's blit to the visible corner (the cost is
 // destination pixels, not source ones).
 
-import type { Sim, TrackData } from './sim';
+import type { Sim } from '../sim';
+import { BaseRenderer, MARK_SIZE, TIRE_WIDTH } from './base';
+import { ASPHALT_TILE, asphaltPixels, CAR_OUTLINE, EDGE_GLOW, shade } from './palette';
+import type { DrawCar, GhostCar, RendererInfo } from './types';
 
-export interface DrawCar {
-  slot: number;
-  x: number;
-  y: number;
-  heading: number;
-  steer: number;
-  color: number;
-  name: string;
-  isLocal: boolean;
-  isBot: boolean;
-  speed: number;
-  wheelSpin: number;
-  braking: boolean;
-  throttle: number;
-  lap: number;
-}
-
-export interface GhostCar {
-  x: number;
-  y: number;
-  heading: number;
-}
-
-const MARK_CANVAS = 2048;
-const MAX_PARTICLES = 700;
-/** Tire contact patch width, in metres. Matches the wheels drawn on the car. */
-const TIRE_WIDTH = 0.4;
-/** A streak breaks if its wheel stopped marking for longer than this, in ms. */
-const CONTACT_GAP = 120;
-/**
- * The neon barrier glow, widest and faintest first, as [line width, alpha].
- *
- * Three stacked strokes rather than one stroke plus `shadowBlur`: same falloff,
- * and it costs three passes over a polyline instead of a Gaussian blur across a
- * scratch surface the size of the entire track.
- */
-const EDGE_GLOW = [
-  [2.4, 0.06],
-  [1.2, 0.14],
-  [0.42, 1],
-] as const;
-
-interface Particle {
-  x: number;
-  y: number;
-  vx: number;
-  vy: number;
-  life: number;
-  maxLife: number;
-  size: number;
-  kind: 0 | 1; // 0 smoke, 1 spark
-  hue: number;
-}
-
-export class Renderer {
+export class Canvas2DRenderer extends BaseRenderer {
+  readonly info: RendererInfo;
   private ctx: CanvasRenderingContext2D;
-  private track: TrackData;
 
   // baked geometry
   private surface = new Path2D();
@@ -101,47 +50,30 @@ export class Renderer {
   // world-space layers
   private marks: HTMLCanvasElement;
   private marksCtx: CanvasRenderingContext2D;
-  private markScale: number;
-  private markOx: number;
-  private markOy: number;
-  private contacts = new Map<number, { x: number; y: number; t: number }>();
   private asphalt: CanvasPattern | null = null;
-
-  private particles: Particle[] = [];
-  private partIdx = 0;
 
   // cached paint
   private bodyGrad = new Map<number, CanvasGradient>();
   private beamGrad: CanvasGradient | null = null;
 
-  // camera
-  camX = 0;
-  camY = 0;
-  camZoom = 15;
-  camRot = 0;
-  rotateCamera = true;
-  showGhost = true;
-  private shake = 0;
   private lastMarkFade = 0;
 
-  constructor(
-    private canvas: HTMLCanvasElement,
-    sim: Sim,
-  ) {
+  constructor(canvas: HTMLCanvasElement, sim: Sim, fallback: string | null) {
+    super(canvas, sim);
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) throw new Error('canvas 2d unavailable');
     this.ctx = ctx;
-    this.track = sim.track;
+    this.info = {
+      backend: 'canvas2d',
+      api: 'Canvas 2D',
+      device: 'browser 2D rasterizer',
+      detail: 'CanvasRenderingContext2D — paths and fills, wherever this browser rasterizes them',
+      fallback,
+    };
 
-    const b = this.track.bounds;
-    const w = b.maxX - b.minX;
-    const h = b.maxY - b.minY;
-    this.markScale = MARK_CANVAS / Math.max(w, h);
-    this.markOx = -b.minX;
-    this.markOy = -b.minY;
     this.marks = document.createElement('canvas');
-    this.marks.width = MARK_CANVAS;
-    this.marks.height = MARK_CANVAS;
+    this.marks.width = MARK_SIZE;
+    this.marks.height = MARK_SIZE;
     this.marksCtx = this.marks.getContext('2d')!;
 
     this.bakeTrack();
@@ -246,86 +178,36 @@ export class Renderer {
     }
   }
 
-  /**
-   * The road surface, as one opaque noise tile.
-   *
-   * The base colour is baked into the tile rather than laid down first and then
-   * glazed with translucent noise: the track outline is an 800-segment path and
-   * filling it is not cheap, so it is worth filling once.
-   */
+  /** The road surface tile, as a repeating pattern in world units. */
   private makeAsphalt() {
-    const size = 128;
     const c = document.createElement('canvas');
-    c.width = c.height = size;
+    c.width = c.height = ASPHALT_TILE;
     const g = c.getContext('2d')!;
-    const img = g.createImageData(size, size);
-    // What #14181f glazed with the old translucent grain actually came out as,
-    // mean and amplitude both.
-    for (let i = 0; i < size * size; i++) {
-      const n = (Math.random() * 46 - 23) * 0.0392;
-      img.data[i * 4] = 24 + n;
-      img.data[i * 4 + 1] = 28 + n;
-      img.data[i * 4 + 2] = 35 + n;
-      img.data[i * 4 + 3] = 255;
-    }
-    g.putImageData(img, 0, 0);
+    g.putImageData(new ImageData(asphaltPixels(), ASPHALT_TILE, ASPHALT_TILE), 0, 0);
     this.asphalt = this.ctx.createPattern(c, 'repeat');
   }
 
   // ------------------------------------------------------------- effects --
 
-  addSmoke(x: number, y: number, vx: number, vy: number, strength: number) {
-    this.spawn(x, y, vx * 0.12 + rnd(0.9), vy * 0.12 + rnd(0.9), 0.32 + strength * 0.5, 0.4 + strength * 0.75, 0, 0);
-  }
-
-  addSpark(x: number, y: number, vx: number, vy: number) {
-    const a = Math.random() * Math.PI * 2;
-    const s = 6 + Math.random() * 14;
-    this.spawn(x, y, vx * 0.2 + Math.cos(a) * s, vy * 0.2 + Math.sin(a) * s, 0.18 + Math.random() * 0.2, 0.22, 1, 30 + Math.random() * 25);
-  }
-
-  private spawn(x: number, y: number, vx: number, vy: number, life: number, size: number, kind: 0 | 1, hue: number) {
-    const p = this.particles[this.partIdx] ?? ({} as Particle);
-    p.x = x;
-    p.y = y;
-    p.vx = vx;
-    p.vy = vy;
-    p.life = life;
-    p.maxLife = life;
-    p.size = size;
-    p.kind = kind;
-    p.hue = hue;
-    this.particles[this.partIdx] = p;
-    this.partIdx = (this.partIdx + 1) % MAX_PARTICLES;
-  }
-
   /**
-   * Dark streak under a sliding tire, accumulated into the world-space layer.
-   *
    * The mark canvas is Y-down and the world is Y-up, so this mapping has to
    * flip Y to match what `drawMarks` undoes on the way back out -- without it
    * every mark lands as a mirrored ghost of the racing line somewhere else on
    * the map instead of under the car that laid it.
-   *
-   * `wheel` identifies one tire across frames: the streak is stroked from that
-   * wheel's previous contact point, so a car at speed leaves one unbroken line
-   * rather than the dotted trail a per-frame stamp would give.
    */
-  addSkid(wheel: number, x: number, y: number, alpha: number) {
+  protected paintSkid(x0: number, y0: number, x1: number, y1: number, alpha: number, joined: boolean) {
     const g = this.marksCtx;
-    const sx = (x + this.markOx) * this.markScale;
-    const sy = MARK_CANVAS - (y + this.markOy) * this.markScale;
-    const now = performance.now();
-    const prev = this.contacts.get(wheel);
-    const ink = `rgba(8,8,12,${Math.min(0.5, alpha)})`;
+    const sx = (x1 + this.markOx) * this.markScale;
+    const sy = MARK_SIZE - (y1 + this.markOy) * this.markScale;
+    const ink = `rgba(8,8,12,${alpha})`;
     const w = TIRE_WIDTH * this.markScale;
 
-    if (prev && now - prev.t < CONTACT_GAP) {
+    if (joined) {
       g.strokeStyle = ink;
       g.lineWidth = w;
       g.lineCap = 'round';
       g.beginPath();
-      g.moveTo(prev.x, prev.y);
+      g.moveTo((x0 + this.markOx) * this.markScale, MARK_SIZE - (y0 + this.markOy) * this.markScale);
       g.lineTo(sx, sy);
       g.stroke();
     } else {
@@ -335,108 +217,19 @@ export class Renderer {
       g.arc(sx, sy, w / 2, 0, Math.PI * 2);
       g.fill();
     }
-
-    if (prev) {
-      prev.x = sx;
-      prev.y = sy;
-      prev.t = now;
-    } else {
-      this.contacts.set(wheel, { x: sx, y: sy, t: now });
-    }
-  }
-
-  impulse(strength: number) {
-    this.shake = Math.min(26, this.shake + strength);
-  }
-
-  // -------------------------------------------------------------- camera --
-
-  updateCamera(
-    target: { x: number; y: number; heading: number } | null,
-    vx: number,
-    vy: number,
-    dt: number,
-    snap = false,
-  ) {
-    if (!target) return;
-    const speed = Math.hypot(vx, vy);
-
-    // Rotation first: the chase offset below rides on the angle we settle on.
-    if (this.rotateCamera) {
-      // Screen up is the car's nose, so the view is parked behind it looking
-      // forward. Track the heading rather than the velocity -- a spin should
-      // swing the camera round with the car, not chase where it is sliding.
-      let d = target.heading - Math.PI / 2 - this.camRot;
-      while (d > Math.PI) d -= Math.PI * 2;
-      while (d < -Math.PI) d += Math.PI * 2;
-      this.camRot += d * (1 - Math.pow(0.02, dt));
-    } else {
-      this.camRot *= Math.pow(0.02, dt);
-    }
-
-    // Look where you are going, and pull back as the speed rises.
-    const lead = Math.min(1, speed / 45);
-    let tx: number;
-    let ty: number;
-    if (this.rotateCamera) {
-      // Push the focus straight up the screen (the camera's forward axis), so
-      // the car sits low in frame with the road ahead of it. Keeping the
-      // offset on that axis and not on the heading holds the car on the
-      // centreline while the rotation is still catching up.
-      const ahead = 4 + lead * 10;
-      tx = target.x - Math.sin(this.camRot) * ahead;
-      ty = target.y + Math.cos(this.camRot) * ahead;
-    } else {
-      tx = target.x + vx * 0.42 * lead;
-      ty = target.y + vy * 0.42 * lead;
-    }
-    if (snap) {
-      // Spectating: we have no velocity for the car, so smoothing would only
-      // trail behind it. Sit on the mark instead.
-      this.camX = tx;
-      this.camY = ty;
-    } else {
-      const k = 1 - Math.pow(0.0025, dt);
-      this.camX += (tx - this.camX) * k;
-      this.camY += (ty - this.camY) * k;
-    }
-
-    const zoomTarget = 17.5 - Math.min(7.5, speed * 0.135);
-    this.camZoom += (zoomTarget - this.camZoom) * (1 - Math.pow(0.05, dt));
-
-    this.shake *= Math.pow(0.02, dt);
   }
 
   // ----------------------------------------------------------------- draw --
 
-  /** World-space radius that certainly covers the viewport, whatever the
-   *  camera rotation, plus room for a car straddling the edge. */
-  private viewReach(w: number, h: number): number {
-    return Math.hypot(w, h) / 2 / this.camZoom + 6;
-  }
-
-  private inView(x: number, y: number, reach: number): boolean {
-    const dx = x - this.camX;
-    const dy = y - this.camY;
-    return dx * dx + dy * dy < reach * reach;
-  }
-
   draw(cars: DrawCar[], ghost: GhostCar | null, dt: number, localSpeed: number) {
     const ctx = this.ctx;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = this.canvas.clientWidth;
-    const h = this.canvas.clientHeight;
-    if (this.canvas.width !== w * dpr || this.canvas.height !== h * dpr) {
-      this.canvas.width = Math.round(w * dpr);
-      this.canvas.height = Math.round(h * dpr);
-    }
+    const { w, h, dpr } = this.resizeBacking();
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     // No clear: the backdrop is opaque and covers the canvas.
     this.drawBackdrop(w, h);
 
-    const shakeX = this.shake > 0.2 ? rnd(this.shake * 0.5) : 0;
-    const shakeY = this.shake > 0.2 ? rnd(this.shake * 0.5) : 0;
+    const [shakeX, shakeY] = this.shakeOffset();
 
     // A full grid is two dozen cars, and the camera holds about a tenth of the
     // circuit -- most of them are somewhere else entirely.
@@ -470,7 +263,7 @@ export class Renderer {
       this.lastMarkFade = now;
       this.marksCtx.globalCompositeOperation = 'destination-out';
       this.marksCtx.fillStyle = 'rgba(0,0,0,0.035)';
-      this.marksCtx.fillRect(0, 0, MARK_CANVAS, MARK_CANVAS);
+      this.marksCtx.fillRect(0, 0, MARK_SIZE, MARK_SIZE);
       this.marksCtx.globalCompositeOperation = 'source-over';
     }
   }
@@ -561,7 +354,7 @@ export class Renderer {
     ctx.translate(-this.markOx, -this.markOy);
     ctx.scale(s, s);
     // The marks canvas is Y-down; the world transform is Y-up, so flip back.
-    ctx.translate(0, MARK_CANVAS);
+    ctx.translate(0, MARK_SIZE);
     ctx.scale(1, -1);
     ctx.drawImage(this.marks, 0, 0);
     ctx.restore();
@@ -682,18 +475,8 @@ export class Renderer {
 
   private drawParticles(ctx: CanvasRenderingContext2D, dt: number, reach: number) {
     ctx.save();
-    for (const p of this.particles) {
-      if (!p || p.life <= 0) continue;
-      p.life -= dt;
-      p.x += p.vx * dt;
-      p.y += p.vy * dt;
-      p.vx *= 0.965;
-      p.vy *= 0.965;
-      if (p.life <= 0) continue;
-      // Smoke from a bot on the far side of the circuit still has to age, but
-      // it does not have to be rasterized.
-      if (!this.inView(p.x, p.y, reach)) continue;
-      const t = p.life / p.maxLife;
+    this.stepParticles(dt, (p, t) => {
+      if (!this.inView(p.x, p.y, reach)) return;
       if (p.kind === 0) {
         const r = p.size * (2.2 - t * 1.2);
         ctx.globalAlpha = t * t * 0.16;
@@ -708,7 +491,7 @@ export class Renderer {
         ctx.arc(p.x, p.y, p.size * t, 0, Math.PI * 2);
         ctx.fill();
       }
-    }
+    });
     ctx.globalAlpha = 1;
     ctx.restore();
   }
@@ -767,76 +550,17 @@ export class Renderer {
     ctx.stroke();
     ctx.restore();
   }
-
-  // ------------------------------------------------------------- minimap --
-
-  drawMinimap(canvas: HTMLCanvasElement, sim: Sim, cars: DrawCar[]) {
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = canvas.clientWidth;
-    const h = canvas.clientHeight;
-    if (canvas.width !== w * dpr) {
-      canvas.width = w * dpr;
-      canvas.height = h * dpr;
-    }
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, w, h);
-
-    const b = sim.track.bounds;
-    const pad = 6;
-    const scale = Math.min((w - pad * 2) / (b.maxX - b.minX), (h - pad * 2) / (b.maxY - b.minY));
-    const ox = w / 2 - ((b.minX + b.maxX) / 2) * scale;
-    const oy = h / 2 + ((b.minY + b.maxY) / 2) * scale;
-    const px = (x: number) => ox + x * scale;
-    const py = (y: number) => oy - y * scale;
-
-    ctx.beginPath();
-    const { points, samples } = sim.track;
-    for (let i = 0; i <= samples; i++) {
-      const k = i % samples;
-      const x = px(points[k * 2]);
-      const y = py(points[k * 2 + 1]);
-      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-    }
-    ctx.closePath();
-    ctx.strokeStyle = 'rgba(120,190,255,0.32)';
-    ctx.lineWidth = Math.max(2.5, sim.track.halfWidth[0] * scale * 1.6);
-    ctx.stroke();
-    ctx.strokeStyle = 'rgba(56,232,255,0.5)';
-    ctx.lineWidth = 1;
-    ctx.stroke();
-
-    for (const c of cars) {
-      ctx.beginPath();
-      ctx.arc(px(c.x), py(c.y), c.isLocal ? 3.4 : 2.4, 0, Math.PI * 2);
-      ctx.fillStyle = c.isLocal ? '#ffffff' : `#${c.color.toString(16).padStart(6, '0')}`;
-      ctx.fill();
-      if (c.isLocal) {
-        ctx.strokeStyle = '#22d3ee';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-      }
-    }
-  }
-
-  worldFromScreen() {
-    return { x: this.camX, y: this.camY, zoom: this.camZoom };
-  }
 }
 
 // ------------------------------------------------------------------ utils --
 
 function carBody(ctx: CanvasRenderingContext2D) {
   ctx.beginPath();
-  ctx.moveTo(2.1, -0.62);
-  ctx.lineTo(1.55, -0.95);
-  ctx.lineTo(-1.65, -0.95);
-  ctx.lineTo(-2.1, -0.66);
-  ctx.lineTo(-2.1, 0.66);
-  ctx.lineTo(-1.65, 0.95);
-  ctx.lineTo(1.55, 0.95);
-  ctx.lineTo(2.1, 0.62);
+  for (let i = 0; i < CAR_OUTLINE.length; i += 2) {
+    const x = CAR_OUTLINE[i];
+    const y = CAR_OUTLINE[i + 1];
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
   ctx.closePath();
 }
 
@@ -850,21 +574,7 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.closePath();
 }
 
-function shade(hex: string, amount: number): string {
-  const n = parseInt(hex.slice(1), 16);
-  const f = (shift: number) => {
-    const v = (n >> shift) & 255;
-    const out = amount < 0 ? v * (1 + amount) : v + (255 - v) * amount;
-    return Math.round(Math.max(0, Math.min(255, out)));
-  };
-  return `rgb(${f(16)},${f(8)},${f(0)})`;
-}
-
-function rnd(mag: number): number {
-  return (Math.random() - 0.5) * 2 * mag;
-}
-
-function edgeInset(
+export function edgeInset(
   pt: readonly [number, number],
   points: Float32Array,
   i: number,

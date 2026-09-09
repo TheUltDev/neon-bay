@@ -11,7 +11,7 @@
     "skipLibCheck": true,
     "isolatedModules": true,
     "noEmit": true,
-    "types": []
+    "types": ["@webgpu/types"]
   },
   "include": ["src"]
 }

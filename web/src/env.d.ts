@@ -1,7 +1,8 @@
 // Build-time configuration, substituted by Vite from `VITE_`-prefixed
-// environment variables. tsconfig deliberately keeps `types: []`, so the two
-// the client actually reads are declared here rather than pulling in the whole
-// of `vite/client` for them.
+// environment variables. tsconfig pulls in `@webgpu/types` and nothing else --
+// WebGPU is not in TypeScript's DOM library yet and the renderer needs it
+// checked -- so the two variables the client actually reads are declared here
+// rather than pulling in the whole of `vite/client` for them.
 
 interface ImportMetaEnv {
   /** Where the built client looks for SpacetimeDB, e.g. `https://x.up.railway.app`. */

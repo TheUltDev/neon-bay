@@ -3,10 +3,10 @@
 // of the sidecar that its inputs arrive on time.
 
 import { GameAudio, type Bus } from './audio';
-import { Hud, type HudState, type LeaderRow } from './hud';
+import { Hud, type GfxState, type HudState, type LeaderRow } from './hud';
 import { Controls } from './input';
 import { Net } from './net';
-import { Renderer, type DrawCar } from './render';
+import { backendSupport, createRenderer, switchRenderer, type Backend, type DrawCar, type Renderer } from './render';
 import { DT, F, loadSim, type Sim } from './sim';
 
 /** Extra ticks of headroom on top of the measured round trip. */
@@ -39,9 +39,11 @@ function serverUri(): { uri: string; db: string } {
 }
 
 async function boot() {
-  const canvas = $<HTMLCanvasElement>('stage');
   const sim = await loadSim('/physics.wasm');
-  const renderer = new Renderer(canvas, sim);
+  // WebGPU, else WebGL 2, else Canvas2D. The picker may hand the stage a fresh
+  // canvas element on the way down -- a canvas only ever gets one kind of
+  // context -- so nothing below should hold on to the one it started with.
+  let renderer = await createRenderer($<HTMLCanvasElement>('stage'), sim);
   const hud = new Hud();
   const controls = new Controls();
   const audio = new GameAudio();
@@ -102,13 +104,65 @@ async function boot() {
   // Nothing should be playing into a tab nobody is looking at.
   document.addEventListener('visibilitychange', () => audio.setHidden(document.hidden));
 
+  // --- renderer picker -----------------------------------------------------
+  // Bound before the connection attempt, like the mixer: with no server to talk
+  // to the renderer is the only thing on the page still doing anything, which
+  // makes the offline screen the most interesting place of all to change tiers.
+  //
+  // Which tiers are on offer is asked of the browser rather than assumed, and
+  // the answer takes a moment to come back, so the two we are not already using
+  // start out disabled and light up when the probe lands.
+  const gfxButtons = new Map<Backend, HTMLButtonElement>();
+  let gfxSupport: Record<Backend, string | null> = {
+    webgpu: 'checking…',
+    webgl2: 'checking…',
+    canvas2d: 'checking…',
+  };
+  let switching = false;
+  const paintPicker = () => {
+    for (const [backend, button] of gfxButtons) {
+      const live = backend === renderer.info.backend;
+      const why = live ? null : gfxSupport[backend];
+      button.classList.toggle('on', live);
+      button.disabled = switching || !!why;
+      button.title = why ?? (live ? 'drawing this frame' : `switch to ${button.textContent}`);
+    }
+  };
+  const pickRenderer = async (choice: Backend) => {
+    if (switching || choice === renderer.info.backend || gfxSupport[choice]) return;
+    switching = true;
+    paintPicker();
+    try {
+      renderer = await switchRenderer(renderer, sim, choice);
+      const dbg = (window as unknown as Record<string, Record<string, unknown>>).__neon;
+      if (dbg) dbg.renderer = renderer;
+      hud.toast(`drawing on ${renderer.info.api}`);
+    } catch (e) {
+      hud.toast(`could not switch renderer: ${e}`, 3000);
+    } finally {
+      switching = false;
+      paintPicker();
+    }
+  };
+  for (const button of Array.from($('gfx-pick').querySelectorAll('button'))) {
+    const backend = button.dataset.gfx as Backend;
+    gfxButtons.set(backend, button);
+    button.addEventListener('click', () => pickRenderer(backend));
+  }
+  gfxSupport[renderer.info.backend] = null;
+  paintPicker();
+  backendSupport(renderer.info.backend).then((support) => {
+    gfxSupport = support;
+    paintPicker();
+  });
+
   const { uri, db } = serverUri();
   try {
     await net.connect(uri, db);
     $('g-status').textContent = `connected to ${db} at ${uri}`;
   } catch (e) {
     $('g-status').innerHTML = `<b style="color:var(--red)">could not reach ${uri}</b><br>start SpacetimeDB and publish the module, then reload.`;
-    startRenderOnly(renderer, sim, hud);
+    startRenderOnly(() => renderer, sim, hud);
     return;
   }
 
@@ -177,7 +231,7 @@ async function boot() {
       joined = true;
       lastName = name;
       $('gate').classList.add('hidden');
-      canvas.focus();
+      $<HTMLCanvasElement>('stage').focus();
     } catch (e) {
       $('g-status').textContent = `join failed: ${e}`;
       $<HTMLButtonElement>('g-join').disabled = false;
@@ -347,7 +401,7 @@ async function boot() {
     }
     if (now - hudAt >= 1000 / HUD_HZ) {
       hudAt = now;
-      hud.update(buildHudState(sim, net, correctionsPerSec, serverNow, fps));
+      hud.update(buildHudState(sim, net, renderer, correctionsPerSec, serverNow, fps));
     }
 
     if (audio.running && sim.localSlot >= 0) {
@@ -490,6 +544,7 @@ function spawnEffects(renderer: Renderer, cars: DrawCar[], dt: number) {
 function buildHudState(
   sim: Sim,
   net: Net,
+  renderer: Renderer,
   correctionsPerSec: number,
   serverNow: number,
   fps: number,
@@ -516,6 +571,7 @@ function buildHudState(
           ? 'online'
           : 'offline',
     fps,
+    gfx: gfxState(renderer),
     serverTick: Math.round(serverNow),
     clientTick: sim.localTick,
     lead: has ? sim.localTick - Math.round(serverNow) : 0,
@@ -538,6 +594,21 @@ function buildHudState(
     lastLap: has ? sim.field(slot, F.lastLap) : 0,
     bestLap: has ? sim.field(slot, F.bestLap) : 0,
     leaderboard: top,
+  };
+}
+
+/** What the renderer panel shows: which backend, on what, at what size. */
+function gfxState(renderer: Renderer): GfxState {
+  const info = renderer.info;
+  return {
+    api: info.api,
+    device: info.device,
+    detail: info.detail,
+    fallback: info.fallback,
+    w: renderer.size.w,
+    h: renderer.size.h,
+    dpr: renderer.size.dpr,
+    accelerated: info.backend !== 'canvas2d',
   };
 }
 
@@ -605,30 +676,39 @@ function frameCounter(): (now: number) => number {
   };
 }
 
-/** Offline fallback: still show the circuit so the page is not a blank void. */
-function startRenderOnly(renderer: Renderer, sim: Sim, hud: Hud) {
+/**
+ * Offline fallback: still show the circuit so the page is not a blank void.
+ *
+ * Takes the renderer by way of a getter rather than a reference, because the
+ * picker can hand the page a different one at any point and this loop outlives
+ * every one of them.
+ */
+function startRenderOnly(current: () => Renderer, sim: Sim, hud: Hud) {
   let last = performance.now();
   const measureFps = frameCounter();
   const loop = (now: number) => {
     const dt = Math.min((now - last) / 1000, 0.1);
     last = now;
+    const renderer = current();
     renderer.camX = Math.cos(now / 9000) * 120;
     renderer.camY = Math.sin(now / 9000) * 120;
     renderer.camZoom = 6;
     renderer.draw([], null, dt, 0);
     renderer.drawMinimap($<HTMLCanvasElement>('minimap'), sim, []);
-    // Nothing else on this page has a number in it, and the renderer is the
-    // only thing still running -- so the frame rate is worth showing even here.
-    hud.update({ ...offlineHud(), fps: measureFps(now) });
+    // The renderer is the only thing still running, so its panel holds the only
+    // live numbers on the page -- which is exactly when the frame rate earns
+    // its place.
+    hud.update({ ...offlineHud(renderer), fps: measureFps(now) });
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);
 }
 
-function offlineHud(): HudState {
+function offlineHud(renderer: Renderer): HudState {
   return {
     authority: 'offline',
     fps: 0,
+    gfx: gfxState(renderer),
     serverTick: 0,
     clientTick: 0,
     lead: 0,
