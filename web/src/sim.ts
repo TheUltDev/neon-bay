@@ -1,25 +1,32 @@
 // Client-side simulation: the same Rust physics as the sidecar, compiled to
 // wasm, plus the netcode that keeps it honest.
 //
-// The loop is the classic three-part arrangement:
+// The loop is the classic arrangement, in four parts:
 //
-//   1. PREDICT   every tick, step the local car immediately from local input,
-//                so steering feels instant regardless of ping.
-//   2. RECONCILE when an authoritative snapshot arrives for tick T, compare it
-//                with what we predicted for T. If they differ, rewind to the
-//                server's state and replay the inputs from T+1 to now -- with
-//                the other cars put back where they were at each replayed
-//                tick, so the contact is the one the authority resolved.
-//   3. SMOOTH    a rewind moves the car. Rather than teleport, keep the visual
+//   1. PREDICT   every tick, step the whole grid immediately: the local car
+//                from local input, so steering feels instant regardless of
+//                ping, and every rival from the controls the authority
+//                published with its last snapshot, held.
+//   2. RECONCILE when an authoritative snapshot arrives for tick T, rewind
+//                every car to what the authority had at T and replay to now --
+//                the local car on its recorded inputs, the rivals on their
+//                held ones. The contact that gets replayed is then the contact
+//                the authority resolved.
+//   3. SMOOTH    a rewind moves the cars. Rather than teleport, keep the visual
 //                error as an offset and decay it to zero over ~200 ms.
 //   4. INTERPOLATE the simulation moves in 60 Hz jumps and the display does not.
 //                Draw the fraction of a tick the frame actually falls on, or
-//                the car stutters against a camera that moves every frame.
+//                the cars stutter against a camera that moves every frame.
 //
-// Because the wasm and the sidecar run bit-identical code (see
-// scripts/verify-determinism.mjs), step 2 usually finds an error of exactly
-// zero and step 3 has nothing to do. The machinery only earns its keep when
-// packets are late, dropped, or the client is lying.
+// The two halves of step 2 are not the same claim and should not be read as
+// one. The local car's replay is a *replay*: the wasm and the sidecar run
+// bit-identical code (see scripts/verify-determinism.mjs) on identical inputs,
+// so it lands on identical bits and step 3 has nothing to do. A rival's is a
+// *prediction*: the client knows what the other driver was doing at the last
+// snapshot and not what they are doing now, so it will be a few centimetres
+// out and the next snapshot will say so. `stats.error` is the first; it is the
+// number the demo is about, and it stays pinned at zero on a healthy link.
+// `stats.rivalError` is the second, and never will be.
 
 export const TICK_HZ = 60;
 export const DT = 1 / TICK_HZ;
@@ -33,6 +40,25 @@ const EPSILON_ANG = 0.0008;
 const SNAP_DISTANCE = 9.0;
 /** Time constant for bleeding off a visual correction. */
 const SMOOTH_TIME = 0.22;
+
+/**
+ * Ticks a rival is carried on controls the authority has stopped confirming.
+ *
+ * Three-tenths of a second, against a snapshot that should arrive every three
+ * ticks, so in normal running this never fires -- it is the guard for a stream
+ * that has stopped rather than a limit on the prediction. There is no accuracy
+ * argument for letting go sooner: `physics/examples/predict.rs` scores a held
+ * input as the best of its four schemes at every lead it measures, 400 ms
+ * included. There is a different argument for letting go eventually. A rival
+ * whose news has stopped arriving and whose throttle is still buried drives
+ * itself into a barrier and stays there, which is a worse picture than one that
+ * lifts off and coasts to a halt roughly where it was last seen.
+ */
+const HOLD_TICKS = 18;
+
+/** A rival correction bigger than this is a teleport -- a respawn, or a slot
+ *  changing hands -- and gets shown as one instead of slid into place. */
+const RIVAL_SNAP = 4;
 
 /**
  * Field offsets inside a CarState record. Mirrors `physics::car::CarState`
@@ -116,6 +142,22 @@ export interface CarConsts {
 
 export type Input = { throttle: number; steer: number; brake: number; handbrake: number };
 
+/**
+ * One car this client does not own, as the authority last described it.
+ *
+ * Both halves are needed and neither is enough. `state` is where the car was
+ * and what it was doing; `input` is what its driver had their hands on at the
+ * time, which is the one thing the client cannot work out for itself and the
+ * thing that decides where the car goes next.
+ */
+export interface RivalState {
+  slot: number;
+  /** Full CarState record, in `F` order. */
+  state: Float32Array;
+  /** Four floats: throttle, steer, brake, handbrake. */
+  input: Float32Array;
+}
+
 /** What actually gets drawn: prediction plus the residual being smoothed away. */
 export interface RenderPose {
   x: number;
@@ -125,10 +167,15 @@ export interface RenderPose {
 }
 
 export interface NetStats {
-  /** Distance between prediction and authority at the last snapshot, meters. */
+  /** Distance between prediction and authority at the last snapshot, meters.
+   *  The local car's, and a replay rather than a guess: zero on a healthy
+   *  link, and a real fault when it is not. */
   error: number;
   /** Rolling peak, for the telemetry graph. */
   errorPeak: number;
+  /** Worst rival mispredicted by the last snapshot, meters. A guess rather
+   *  than a replay, so never zero -- see the note at the top of this file. */
+  rivalError: number;
   corrections: number;
   resyncs: number;
   replayTicks: number;
@@ -161,6 +208,9 @@ export class Sim {
   localSlot = -1;
   /** Tick the client is currently simulating. Runs ahead of the server. */
   localTick = 0;
+  /** Slots holding a car this world simulates: the local one, plus every rival
+   *  a snapshot has been seeded from. Mirrors the wasm world's own mask. */
+  activeMask = 0;
 
   // --- rollback bookkeeping ---
   private histTick = new Int32Array(HISTORY).fill(-1);
@@ -170,36 +220,40 @@ export class Sim {
   private scratch: number;
   private scratchView!: Float32Array;
   private lastApplied = -1;
+  /** Tick each rival's held controls are released at. See [`HOLD_TICKS`]. */
+  private holdUntil: Int32Array;
 
-  // --- visual error smoothing ---
-  private offX = 0;
-  private offY = 0;
-  private offHeading = 0;
-
-  // --- sub-tick render interpolation ---
-  // The pose one tick behind `localTick`. Frames do not land on tick
-  // boundaries, so the renderer draws somewhere between this and the current
-  // pose rather than holding the current one until the next step lands.
-  private prevX = 0;
-  private prevY = 0;
-  private prevHeading = 0;
-  private prevSteer = 0;
-  private havePrev = false;
-
-  /**
-   * Called before each replayed tick, so the caller can put the remote cars
-   * where the authority had them *then*.
-   *
-   * Without it a rollback re-runs the last few ticks against rivals frozen at
-   * wherever they are now, which is a different collision from the one the
-   * authority resolved -- so the replay disagrees, and the next snapshot
-   * corrects it again.
-   */
-  onReplayTick: ((tick: number) => void) | null = null;
+  // --- per-car render bookkeeping ---
+  // Two things the renderer needs that the physics does not keep, both per
+  // slot rather than per client: every car on the grid is stepped now, so
+  // every car needs them.
+  //
+  // `prev` is the pose one tick back. Frames do not land on tick boundaries, so
+  // the renderer draws somewhere between it and the current pose rather than
+  // holding the current one until the next step lands. Rivals used to get this
+  // for free by being sampled at a fractional tick; simulated, they move in
+  // 60 Hz jumps like anything else.
+  //
+  // `off` is the correction a rewind revealed, kept and decayed rather than
+  // shown. The simulation is corrected at once; the picture catches up.
+  /** x, y, heading, steer at `localTick - 1`, four floats per slot. */
+  private prev: Float32Array;
+  /** Which slots have one. A car that has just arrived does not. */
+  private havePrev = 0;
+  /** x, y, heading still being smoothed away, three floats per slot. */
+  private off: Float32Array;
+  /** Scratch: each car's pose immediately before a rewind, so [`absorb`] can
+   *  work out what the rewind moved. */
+  private before: Float32Array;
+  /** x, y, heading of every simulated car at each recent tick. Only the local
+   *  car needs to be *replayed* from its past, but every rival needs to be
+   *  scored against it: this is what the next snapshot judges the guess by. */
+  private histPose: Float32Array;
 
   stats: NetStats = {
     error: 0,
     errorPeak: 0,
+    rivalError: 0,
     corrections: 0,
     resyncs: 0,
     replayTicks: 0,
@@ -238,33 +292,66 @@ export class Sim {
     this.histState = new Float32Array(HISTORY * this.stride);
     this.scratch = wasm.phys_scratch_ptr();
     this.scratchView = new Float32Array(wasm.memory.buffer, this.scratch, this.stride);
+    this.prev = new Float32Array(maxCars * 4);
+    this.off = new Float32Array(maxCars * 3);
+    this.before = new Float32Array(maxCars * 4);
+    this.histPose = new Float32Array(HISTORY * maxCars * 3);
+    this.holdUntil = new Int32Array(maxCars);
   }
 
   setLocalSlot(slot: number) {
     if (this.localSlot === slot) return;
     this.localSlot = slot;
+    // Taking a seat starts an empty grid holding one car -- this one, which is
+    // put right by the first snapshot. The rivals join it as `reconcile` hears
+    // from them, because there is nothing to seed a slot from until then and a
+    // slot nobody has written still holds whoever sat in it last.
+    //
+    // Losing a seat empties it again. Nothing steps without a local car, so a
+    // slot left in the mask would be a rival frozen at whatever tick the seat
+    // was lost on; a spectator draws the field from the network buffer
+    // instead, and `main.ts` decides which of the two it is looking at by
+    // asking [`simulates`].
+    this.setActive(slot >= 0 ? 1 << slot : 0);
     this.histTick.fill(-1);
     this.lastApplied = -1;
-    this.offX = this.offY = this.offHeading = 0;
-    this.havePrev = false;
+    this.havePrev = 0;
+    this.off.fill(0);
   }
 
-  setActive(mask: number) {
+  private setActive(mask: number) {
+    this.activeMask = mask;
     this.wasm.phys_set_active(mask);
   }
 
-  /** Park a non-simulated car so it still collides at its interpolated pose. */
-  placeRemote(slot: number, x: number, y: number, heading: number, vx: number, vy: number) {
-    const b = slot * this.stride;
-    this.cars[b + F.x] = x;
-    this.cars[b + F.y] = y;
-    this.cars[b + F.heading] = heading;
-    this.cars[b + F.vx] = vx;
-    this.cars[b + F.vy] = vy;
-    this.cars[b + F.active] = 1;
+  /** Drop every slot no longer held by a car. Cars leave at once; they only
+   *  arrive with a snapshot in hand. */
+  retainActive(live: number) {
+    this.setActive(this.activeMask & live);
   }
 
-  /** Advance the local car one tick under `input`, recording it for replay. */
+  /** Is this slot one this client is simulating? */
+  simulates(slot: number): boolean {
+    return slot >= 0 && (this.activeMask & (1 << slot)) !== 0;
+  }
+
+  /** Forget what was being drawn for a slot: no pose to interpolate from, and
+   *  no correction to smooth away. For a slot that has just changed hands. */
+  private forget(slot: number) {
+    this.havePrev &= ~(1 << slot);
+    this.off[slot * 3] = this.off[slot * 3 + 1] = this.off[slot * 3 + 2] = 0;
+  }
+
+  /**
+   * Advance the whole grid one tick: the local car under `input`, recorded for
+   * replay, and every rival on the controls its last snapshot came with.
+   *
+   * The rivals used to be parked here as immovable colliders at an extrapolated
+   * pose, which is a car that corners without a steering wheel and brakes
+   * without a brake pedal -- and it is precisely mid-corner and under braking
+   * that a client most needs to know where a rival is about to be. Stepping
+   * them costs the grid instead of one car; what it buys is in `predict.rs`.
+   */
   step(input: Input) {
     if (this.localSlot < 0) return;
     const slot = this.localSlot;
@@ -277,33 +364,78 @@ export class Sim {
     this.inputs[si + 2] = this.histInput[hi + 2] = input.brake;
     this.inputs[si + 3] = this.histInput[hi + 3] = input.handbrake;
 
-    const b = slot * this.stride;
-    this.prevX = this.cars[b + F.x];
-    this.prevY = this.cars[b + F.y];
-    this.prevHeading = this.cars[b + F.heading];
-    this.prevSteer = this.cars[b + F.steer];
-    this.havePrev = true;
-
+    this.release(this.localTick);
+    this.markPrev();
     this.wasm.phys_set_tick(this.localTick);
-    this.wasm.phys_step(1 << slot);
+    this.wasm.phys_step(this.activeMask);
     this.localTick++;
     this.record(this.localTick);
   }
 
-  /** File the local car's current state as what was simulated for `tick`. */
+  /** Take every simulated car's current pose as the one to interpolate away
+   *  from on the frames between this tick and the next. */
+  private markPrev() {
+    for (let slot = 0; slot < this.consts.maxCars; slot++) {
+      if (!(this.activeMask & (1 << slot))) continue;
+      const b = slot * this.stride;
+      const p = slot * 4;
+      this.prev[p] = this.cars[b + F.x];
+      this.prev[p + 1] = this.cars[b + F.y];
+      this.prev[p + 2] = this.cars[b + F.heading];
+      this.prev[p + 3] = this.cars[b + F.steer];
+      this.havePrev |= 1 << slot;
+    }
+  }
+
+  /** Let go of the controls of any rival whose news has gone stale. */
+  private release(tick: number) {
+    for (let slot = 0; slot < this.consts.maxCars; slot++) {
+      if (slot === this.localSlot || !(this.activeMask & (1 << slot))) continue;
+      if (tick < this.holdUntil[slot]) continue;
+      const i = slot * 4;
+      this.inputs[i] = this.inputs[i + 1] = this.inputs[i + 2] = this.inputs[i + 3] = 0;
+    }
+  }
+
+  /**
+   * File what was simulated for `tick`: the local car in full, because it may
+   * have to be replayed from, and every other car's pose, because the next
+   * snapshot is going to say how good a guess it was.
+   */
   private record(tick: number) {
     const h = tick % HISTORY;
     const b = this.localSlot * this.stride;
     this.histTick[h] = tick;
     this.histState.set(this.cars.subarray(b, b + this.stride), h * this.stride);
+    const base = h * this.consts.maxCars * 3;
+    for (let slot = 0; slot < this.consts.maxCars; slot++) {
+      if (!(this.activeMask & (1 << slot))) continue;
+      const c = slot * this.stride;
+      const p = base + slot * 3;
+      this.histPose[p] = this.cars[c + F.x];
+      this.histPose[p + 1] = this.cars[c + F.y];
+      this.histPose[p + 2] = this.cars[c + F.heading];
+    }
   }
 
   /**
-   * Reconcile against the authority.
+   * Reconcile the whole grid against the authority.
    *
-   * `state` is a full CarState record as the sidecar had it at `tick`.
+   * `state` is a full CarState record as the sidecar had it at `tick`, and
+   * `rivals` is the same for every other car on the grid, each with the
+   * controls its driver had their hands on at the time.
+   *
+   * The two halves are reconciled differently because they mean different
+   * things. The local car is *rewound and replayed*: this client owns it, has
+   * every input it gave it since `tick`, and has to arrive back at its own
+   * answer. A rival is simply *overwritten* -- no blending, no smoothing of
+   * the state itself. The client has no stake in a car it does not own, the
+   * snapshot is not an opinion, and the residual it reveals is an apology for
+   * a guess that has now been corrected: feeding that back into the next
+   * contact would re-introduce exactly the error it was hiding. It goes into
+   * the picture ([`off`]) and nowhere near the physics.
    */
-  reconcile(tick: number, state: Float32Array) {
+  reconcile(tick: number, state: Float32Array, rivals: RivalState[]) {
     if (this.localSlot < 0) return;
     if (tick <= this.lastApplied) return;
     this.lastApplied = tick;
@@ -313,9 +445,31 @@ export class Sim {
     const h = tick % HISTORY;
     const known = this.histTick[h] === tick && tick <= this.localTick;
 
+    // How far out the last round of guesses turned out to be, scored before
+    // any of them is overwritten.
+    this.stats.rivalError = this.measure(tick, rivals);
+    // And where every car was about to be drawn, so what follows can be kept
+    // as a fading offset rather than shown as a jump.
+    const drawn = this.markBefore();
+
+    // Adopt the authority's word on every rival, and admit any car this is the
+    // first news of -- a slot nobody has written still holds whoever sat in it
+    // last, and stepping that would be simulating a ghost.
+    let mask = 1 << slot;
+    for (const r of rivals) {
+      if (!(this.activeMask & (1 << r.slot))) this.forget(r.slot);
+      this.scratchView.set(r.state);
+      this.wasm.phys_set(r.slot, this.scratch);
+      this.inputs.set(r.input, r.slot * 4);
+      this.holdUntil[r.slot] = tick + HOLD_TICKS;
+      mask |= 1 << r.slot;
+    }
+    this.setActive(mask);
+
     if (!known) {
       // No history for that tick: either we just joined, or we fell so far
-      // behind that the ring buffer wrapped. Accept the server wholesale.
+      // behind that the ring buffer wrapped. Accept the server wholesale. The
+      // rivals already have, and the clock goes back to meet them.
       this.hardSet(slot, tick, state);
       return;
     }
@@ -328,57 +482,118 @@ export class Sim {
     this.stats.error = err;
     this.stats.errorPeak = Math.max(this.stats.errorPeak * 0.97, err);
 
-    if (err < EPSILON_POS && Math.abs(dh) < EPSILON_ANG) {
-      // Prediction was exact. Adopt the authoritative record anyway so tiny
-      // differences in fields we do not compare cannot accumulate.
-      this.histState.set(state, h * this.stride);
-      return;
-    }
-
     if (err > SNAP_DISTANCE) {
       this.hardSet(slot, tick, state);
       this.stats.resyncs++;
       return;
     }
 
-    // Remember where the car *appeared* to be, rewind, replay, then keep the
-    // difference as a visual offset so the picture never jumps.
-    const b = slot * this.stride;
-    const wasX = this.cars[b + F.x];
-    const wasY = this.cars[b + F.y];
-    const wasH = this.cars[b + F.heading];
-    const wasSteer = this.cars[b + F.steer];
-    const preX = wasX + this.offX;
-    const preY = wasY + this.offY;
-    const preH = wasH + this.offHeading;
-
+    // Rewind and replay -- even when the local car was predicted exactly.
+    // There is no fast path out of here any more: the rivals have just been
+    // put back to where the authority had them at `tick` and the world is
+    // still due at `localTick`, so somebody has to walk them there. The local
+    // car comes along for free, and adopting the authoritative record for it
+    // keeps tiny differences in fields that are not compared from
+    // accumulating.
     this.scratchView.set(state);
     this.wasm.phys_set(slot, this.scratch);
+    this.histState.set(state, h * this.stride);
 
     let replayed = 0;
     for (let t = tick; t < this.localTick; t++) {
       const j = t % HISTORY;
       if (this.histTick[j] !== t) break;
       this.inputs.set(this.histInput.subarray(j * 4, j * 4 + 4), slot * 4);
-      this.onReplayTick?.(t);
+      this.release(t);
       this.wasm.phys_set_tick(t);
-      this.wasm.phys_step(1 << slot);
+      this.wasm.phys_step(mask);
       this.record(t + 1);
       replayed++;
     }
 
-    this.offX = preX - this.cars[b + F.x];
-    this.offY = preY - this.cars[b + F.y];
-    this.offHeading = wrapPi(preH - this.cars[b + F.heading]);
-    // The replay moved the current pose. Carry the previous-tick pose the same
-    // distance, so what the renderer interpolates across is still one tick of
-    // motion rather than one tick plus the whole correction.
-    this.prevX += this.cars[b + F.x] - wasX;
-    this.prevY += this.cars[b + F.y] - wasY;
-    this.prevHeading += wrapPi(this.cars[b + F.heading] - wasH);
-    this.prevSteer += this.cars[b + F.steer] - wasSteer;
-    this.stats.corrections++;
+    this.absorb(drawn & mask);
+    // A correction is a disagreement about the local car, which is the number
+    // the demo is about. The replay above now happens twenty times a second
+    // whatever the local car did, and counting those as corrections would turn
+    // a headline reading into a constant.
+    if (err >= EPSILON_POS || Math.abs(dh) >= EPSILON_ANG) this.stats.corrections++;
     this.stats.replayTicks = replayed;
+  }
+
+  /**
+   * How far out the guesses about the other cars turned out to be, in metres:
+   * the worst of them.
+   *
+   * Not an error to be corrected -- the snapshot *is* the correction -- but the
+   * number that says whether carrying a rival forward through the physics is
+   * working, and the one to watch instead of [`stats.error`] when reading a
+   * rival's behaviour. Zero would mean the client had guessed what another
+   * driver was about to do, which it cannot.
+   */
+  private measure(tick: number, rivals: RivalState[]): number {
+    const h = tick % HISTORY;
+    if (this.histTick[h] !== tick) return 0;
+    const base = h * this.consts.maxCars * 3;
+    let worst = 0;
+    for (const r of rivals) {
+      // A car this client had not yet heard of made no guess to score.
+      if (!(this.activeMask & (1 << r.slot))) continue;
+      const p = base + r.slot * 3;
+      const d = Math.hypot(r.state[F.x] - this.histPose[p], r.state[F.y] - this.histPose[p + 1]);
+      if (d > worst) worst = d;
+    }
+    return worst;
+  }
+
+  /** Save every simulated car's pose, and return the slots saved. */
+  private markBefore(): number {
+    for (let slot = 0; slot < this.consts.maxCars; slot++) {
+      if (!(this.activeMask & (1 << slot))) continue;
+      const b = slot * this.stride;
+      const p = slot * 4;
+      this.before[p] = this.cars[b + F.x];
+      this.before[p + 1] = this.cars[b + F.y];
+      this.before[p + 2] = this.cars[b + F.heading];
+      this.before[p + 3] = this.cars[b + F.steer];
+    }
+    return this.activeMask;
+  }
+
+  /**
+   * Keep the correction a rewind revealed instead of showing it.
+   *
+   * The offset is where the car appeared to be minus where it now is, decaying
+   * to nothing over [`SMOOTH_TIME`]; whatever was still fading is folded in, so
+   * a run of small corrections does not restart the fade each time. The
+   * previous-tick pose is carried the same distance, so what the renderer
+   * interpolates across is still one tick of motion rather than one tick plus
+   * the whole correction.
+   */
+  private absorb(slots: number) {
+    for (let slot = 0; slot < this.consts.maxCars; slot++) {
+      if (!(slots & (1 << slot))) continue;
+      const b = slot * this.stride;
+      const p = slot * 4;
+      const o = slot * 3;
+      const x = this.cars[b + F.x];
+      const y = this.cars[b + F.y];
+      const heading = this.cars[b + F.heading];
+      const steer = this.cars[b + F.steer];
+      this.off[o] += this.before[p] - x;
+      this.off[o + 1] += this.before[p + 1] - y;
+      this.off[o + 2] = wrapPi(this.off[o + 2] + this.before[p + 2] - heading);
+      this.prev[p] += x - this.before[p];
+      this.prev[p + 1] += y - this.before[p + 1];
+      this.prev[p + 2] += wrapPi(heading - this.before[p + 2]);
+      this.prev[p + 3] += steer - this.before[p + 3];
+      // A rival that moved this far did not mispredict, it teleported: a
+      // respawn, or a slot changing hands. Show it rather than sliding the car
+      // across four metres of track over a fifth of a second. The local car
+      // reaches the same conclusion through [`SNAP_DISTANCE`] and a resync.
+      if (slot !== this.localSlot && Math.hypot(this.off[o], this.off[o + 1]) > RIVAL_SNAP) {
+        this.off[o] = this.off[o + 1] = this.off[o + 2] = 0;
+      }
+    }
   }
 
   private hardSet(slot: number, tick: number, state: Float32Array) {
@@ -388,52 +603,75 @@ export class Sim {
     this.localTick = tick;
     this.histTick.fill(-1);
     this.record(tick);
-    this.offX = this.offY = this.offHeading = 0;
-    this.havePrev = false;
+    // A hard set is a discontinuity for the whole picture and not just for the
+    // local car: the clock has moved, and every rival has just been put back to
+    // where the authority had it at `tick`. Nothing on screen has a previous
+    // pose worth interpolating from or a correction worth hiding.
+    this.havePrev = 0;
+    this.off.fill(0);
   }
 
-  /** Bleed the visual correction away. Call once per rendered frame. */
+  /** Bleed the visual corrections away. Call once per rendered frame. */
   decaySmoothing(dt: number) {
     const k = Math.pow(0.001, Math.min(dt, 0.1) / SMOOTH_TIME);
-    this.offX *= k;
-    this.offY *= k;
-    this.offHeading *= k;
-    if (Math.abs(this.offX) < 1e-4) this.offX = 0;
-    if (Math.abs(this.offY) < 1e-4) this.offY = 0;
-    if (Math.abs(this.offHeading) < 1e-5) this.offHeading = 0;
+    for (let i = 0; i < this.off.length; i++) {
+      const v = this.off[i] * k;
+      // A tenth of a millimetre, or six thousandths of a degree. Below either
+      // the offset is not being hidden any more, it is just still there.
+      this.off[i] = Math.abs(v) < 1e-4 ? 0 : v;
+    }
   }
 
-  /** Magnitude of the correction currently being hidden, in meters. */
+  /** Magnitude of the correction currently being hidden on the local car, in
+   *  meters. */
   get smoothingResidual(): number {
-    return Math.hypot(this.offX, this.offY);
+    if (this.localSlot < 0) return 0;
+    const o = this.localSlot * 3;
+    return Math.hypot(this.off[o], this.off[o + 1]);
   }
 
   /**
-   * Pose to draw for the local car.
+   * Pose to draw for a simulated car.
    *
    * `alpha` is how far into the current tick this frame falls: the fixed-step
-   * accumulator's remainder over the step size. Without it the car only moves
-   * on the frames that happen to run a tick, which reads as a stutter against a
+   * accumulator's remainder over the step size. Without it a car only moves on
+   * the frames that happen to run a tick, which reads as a stutter against a
    * camera and a track that move every frame -- and at 120 Hz or above, as the
    * car holding still for every second frame. On top of the interpolation goes
    * the residual from the last correction, decaying away.
+   *
+   * The local car used to be the only one that needed this, rivals being drawn
+   * at whatever fractional tick was asked for. Now that every car on the grid
+   * is stepped, every car needs it.
    */
-  localPose(alpha = 1): RenderPose {
-    const b = this.localSlot * this.stride;
+  pose(slot: number, alpha = 1): RenderPose {
+    const b = slot * this.stride;
+    const p = slot * 4;
+    const o = slot * 3;
     const x = this.cars[b + F.x];
     const y = this.cars[b + F.y];
     const heading = this.cars[b + F.heading];
     const steer = this.cars[b + F.steer];
-    if (!this.havePrev) {
-      return { x: x + this.offX, y: y + this.offY, heading: heading + this.offHeading, steer };
+    if (!(this.havePrev & (1 << slot))) {
+      return {
+        x: x + this.off[o],
+        y: y + this.off[o + 1],
+        heading: heading + this.off[o + 2],
+        steer,
+      };
     }
     const t = alpha < 0 ? 0 : alpha > 1 ? 1 : alpha;
     return {
-      x: this.prevX + (x - this.prevX) * t + this.offX,
-      y: this.prevY + (y - this.prevY) * t + this.offY,
-      heading: this.prevHeading + wrapPi(heading - this.prevHeading) * t + this.offHeading,
-      steer: this.prevSteer + (steer - this.prevSteer) * t,
+      x: this.prev[p] + (x - this.prev[p]) * t + this.off[o],
+      y: this.prev[p + 1] + (y - this.prev[p + 1]) * t + this.off[o + 1],
+      heading: this.prev[p + 2] + wrapPi(heading - this.prev[p + 2]) * t + this.off[o + 2],
+      steer: this.prev[p + 3] + (steer - this.prev[p + 3]) * t,
     };
+  }
+
+  /** Pose to draw for the local car. */
+  localPose(alpha = 1): RenderPose {
+    return this.pose(this.localSlot, alpha);
   }
 
   field(slot: number, f: number): number {

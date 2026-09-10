@@ -28,6 +28,11 @@ export interface HudState {
   lead: number;
   rttMs: number;
   error: number;
+  /** Worst rival the last snapshot caught this client mispredicting, metres.
+   *  A different kind of number from `error` above and worth keeping apart:
+   *  that one is a replay and should be zero, this one is a guess about what
+   *  another driver did next and never will be. */
+  rivalError: number;
   smoothing: number;
   correctionsPerSec: number;
   replayTicks: number;
@@ -206,6 +211,7 @@ export class Hud {
     this.set('k-rtt', s.rttMs > 0 ? `${s.rttMs.toFixed(0)} ms` : '—');
     this.set('k-err', `${s.error.toFixed(3)} m`);
     this.css('k-err', 'color', s.error > 0.25 ? 'var(--pink)' : s.error > 0.02 ? 'var(--amber)' : 'var(--green)');
+    this.set('k-rival', `${s.rivalError.toFixed(3)} m`);
     this.set('k-smooth', `${s.smoothing.toFixed(3)} m`);
     this.set('k-corr', `${s.correctionsPerSec.toFixed(1)} /s`);
     this.set('k-replay', `${s.replayTicks}`);

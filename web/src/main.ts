@@ -1,16 +1,17 @@
-// Entry point: fixed-step prediction loop, prediction of everyone else from
-// their last published pose, and the clock sync that keeps the client running
-// just far enough ahead of the sidecar that its inputs arrive on time.
+// Entry point: fixed-step prediction loop, and the clock sync that keeps the
+// client running just far enough ahead of the sidecar that its inputs arrive
+// on time.
 //
-// One clock runs the whole picture: the tick the local car is predicting. The
-// rivals it leans on are carried forward to that same tick, so what you see,
-// what you hit, and what the authority resolves are the same arrangement of
-// cars -- rather than a local car in the future beside rivals in the past.
+// One clock runs the whole picture: the tick the local car is predicting.
+// Every other car on the grid is simulated to that same tick, from the pose and
+// the controls the authority last published for it, so what you see, what you
+// hit, and what the authority resolves are the same arrangement of cars --
+// rather than a local car in the future beside rivals in the past.
 
 import { GameAudio, type Bus } from './audio';
 import { Hud, type GfxState, type HudState, type LeaderRow } from './hud';
 import { Controls } from './input';
-import { Net } from './net';
+import { Net, type Snapshot } from './net';
 import { backendSupport, createRenderer, switchRenderer, type Backend, type DrawCar, type Renderer } from './render';
 import { DT, F, loadSim, type Sim } from './sim';
 
@@ -172,12 +173,22 @@ async function boot() {
 
   // --- reconciliation hook -------------------------------------------------
   let pendingToast = 0;
-  // A rollback re-runs the last few ticks. The rivals have to go back with it,
-  // or the replayed contact is not the contact the authority resolved.
-  sim.onReplayTick = (tick) => placeRemotes(sim, net, tick);
-  net.onLocalSnapshot = (snap) => {
+  // Held until the top of the next frame rather than acted on here.
+  //
+  // The sidecar publishes the whole grid in one transaction, and the SDK
+  // delivers it a row at a time. Reconciling on the local car's row would
+  // rewind the world to a tick the rivals whose rows had not arrived yet know
+  // nothing about -- and which half of the grid that is depends on iteration
+  // order. Waiting for the frame lets the whole transaction land first, and
+  // costs nothing: nothing reads the simulation in between.
+  let pending: Snapshot | null = null;
+  net.onLocalSnapshot = (snap) => (pending = snap);
+  const reconcile = () => {
+    if (!pending) return;
+    const snap = pending;
+    pending = null;
     const before = sim.stats.resyncs;
-    sim.reconcile(snap.tick, snap.state);
+    sim.reconcile(snap.tick, snap.state, net.rivals());
     hud.pushError(sim.stats.error);
     if (sim.stats.resyncs > before && performance.now() - pendingToast > 1500) {
       pendingToast = performance.now();
@@ -188,7 +199,11 @@ async function boot() {
   let rejoinAt = 0;
   net.onCarsChanged = () => {
     sim.setLocalSlot(net.mySlot);
-    refreshActiveMask(sim, net);
+    // Cars leave the world the moment their row does; they only join it with a
+    // snapshot in hand, which is `sim.reconcile`'s job.
+    let live = 0;
+    for (const c of net.cars.values()) live |= 1 << c.slot;
+    sim.retainActive(live);
   };
   net.onStatus = (msg) => {
     $('g-status').textContent = msg;
@@ -321,6 +336,11 @@ async function boot() {
     // -- should not strand the player staring at a track they cannot drive on.
     ensureCar(now);
 
+    // Whatever the authority said while this frame was being waited for. Ahead
+    // of the clock sync below, because a resync moves `sim.localTick` and the
+    // drift is measured against it.
+    reconcile();
+
     // ---- clock sync -------------------------------------------------------
     // Run far enough ahead that an input for tick T reaches the sidecar before
     // it simulates T: half a round trip out, plus a little margin.
@@ -350,10 +370,6 @@ async function boot() {
         // about to take. The sidecar holds it until its own clock reaches that
         // tick, which is what keeps the two simulations in lockstep.
         const inputTick = sim.localTick;
-        // The rivals are solid, so they have to be where the authority will
-        // have them for the tick about to run -- not where the last snapshot
-        // left them a round trip ago.
-        placeRemotes(sim, net, sim.localTick);
         sim.step(input);
         sinceInput += DT;
         if (sinceInput >= 1 / INPUT_HZ) {
@@ -439,54 +455,43 @@ function forwardSpeed(sim: Sim): number {
   return sim.field(sim.localSlot, F.vx) * Math.cos(h) + sim.field(sim.localSlot, F.vy) * Math.sin(h);
 }
 
-/** Tell the wasm world which slots hold a car, so collisions include them. */
-function refreshActiveMask(sim: Sim, net: Net) {
-  let mask = 0;
-  for (const c of net.cars.values()) mask |= 1 << c.slot;
-  sim.setActive(mask);
-}
-
-/**
- * Park every remote car where it belongs at `atTick`. They are never integrated
- * by this client -- but they are solid, so you can lean on a rival through a
- * corner and the local prediction reacts immediately.
- */
-function placeRemotes(sim: Sim, net: Net, atTick: number) {
-  for (const meta of net.cars.values()) {
-    if (meta.carId === net.myCarId) continue;
-    const s = net.predictRemote(meta.carId, atTick);
-    if (!s) continue;
-    sim.placeRemote(meta.slot, s[F.x], s[F.y], s[F.heading], s[F.vx], s[F.vy]);
-  }
-}
-
 function collectCars(sim: Sim, net: Net, atTick: number, alpha: number): DrawCar[] {
   const spent = sim.consts.maxCrush;
   const out: DrawCar[] = [];
   for (const meta of net.cars.values()) {
     // Both sources are the same `#[repr(C)]` record: the wasm world holds one
     // per slot, a snapshot holds exactly one. Only the base offset differs.
+    //
+    // Nearly every car is in the world. The exceptions are a spectator's whole
+    // grid, and a car nobody has heard a snapshot for yet; both are drawn from
+    // the network buffer instead.
     const local = meta.carId === net.myCarId && sim.localSlot >= 0;
-    const s = local ? sim.cars : net.sampleRemote(meta.carId, atTick);
+    const simulated = local || sim.simulates(meta.slot);
+    const s = simulated ? sim.cars : net.sampleRemote(meta.carId, atTick);
     if (!s) continue;
-    const b = local ? meta.slot * sim.stride : 0;
-    // The local car is drawn from its predicted pose, which carries the
+    const b = simulated ? meta.slot * sim.stride : 0;
+    // A simulated car is drawn from its predicted pose, which carries the
     // sub-tick interpolation and whatever correction is still being smoothed.
-    const pose = local ? sim.localPose(alpha) : null;
+    const pose = simulated ? sim.pose(meta.slot, alpha) : null;
     out.push({
       slot: meta.slot,
-      x: pose ? pose.x : s[F.x],
-      y: pose ? pose.y : s[F.y],
-      heading: pose ? pose.heading : s[F.heading],
-      steer: pose ? pose.steer : s[F.steer],
+      x: pose ? pose.x : s[b + F.x],
+      y: pose ? pose.y : s[b + F.y],
+      heading: pose ? pose.heading : s[b + F.heading],
+      steer: pose ? pose.steer : s[b + F.steer],
       color: meta.color,
       name: meta.name,
       isLocal: local,
       isBot: meta.isBot,
       speed: Math.hypot(s[b + F.vx], s[b + F.vy]),
       wheelSpin: s[b + F.wheelSpin],
-      braking: local && sim.inputs[meta.slot * 4 + 2] > 0.1,
-      throttle: local ? sim.inputs[meta.slot * 4] : 1,
+      // Every simulated car has real controls loaded, so a rival's brake lights
+      // come on when its driver's did rather than never. A rival used to be
+      // handed a throttle of 1 for want of anything better, which also meant
+      // its headlights were on whatever it was doing; a stopped car with its
+      // foot off the pedal now goes dark, the same as the local one.
+      braking: simulated && sim.inputs[meta.slot * 4 + 2] > 0.1,
+      throttle: simulated ? sim.inputs[meta.slot * 4] : 1,
       lap: s[b + F.lap],
       // Crush comes off the wire like everything else, so a car that has been
       // in an accident looks like it from every browser watching -- including
@@ -600,6 +605,7 @@ function buildHudState(
     lead: has ? sim.localTick - Math.round(serverNow) : 0,
     rttMs: net.rttMs,
     error: sim.stats.error,
+    rivalError: sim.stats.rivalError,
     smoothing: sim.smoothingResidual,
     correctionsPerSec,
     replayTicks: sim.stats.replayTicks,
@@ -741,6 +747,7 @@ function offlineHud(renderer: Renderer): HudState {
     lead: 0,
     rttMs: 0,
     error: 0,
+    rivalError: 0,
     smoothing: 0,
     correctionsPerSec: 0,
     replayTicks: 0,

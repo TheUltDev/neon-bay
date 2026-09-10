@@ -96,6 +96,19 @@ fn from_row(r: &CarState) -> PhysicsCar {
     }
 }
 
+/// The controls that row was computed on. Published beside the pose so a
+/// client can carry a rival forward on them; read back here so a sidecar that
+/// takes over mid-race inherits the driver's hands along with everything else,
+/// rather than releasing every pedal on the grid until the next input lands.
+fn input_from_row(r: &CarState) -> CarInput {
+    CarInput {
+        throttle: r.in_throttle,
+        steer: r.in_steer,
+        brake: r.in_brake,
+        handbrake: if r.in_handbrake { 1.0 } else { 0.0 },
+    }
+}
+
 #[derive(Clone, Default)]
 struct Slot {
     car_id: u32,
@@ -233,8 +246,12 @@ impl Authority {
         }
         self.followed = server_tick;
         for st in conn.db.car_state().iter() {
-            if (st.slot as usize) < MAX_CARS && st.tick > 0 {
-                self.world.adopt(st.slot as usize, from_row(&st));
+            let slot = st.slot as usize;
+            if slot < MAX_CARS && st.tick > 0 {
+                self.world.adopt(slot, from_row(&st));
+                if let Some(s) = self.slots[slot].as_mut() {
+                    s.current = input_from_row(&st);
+                }
             }
         }
         self.world.tick = server_tick + 1;
@@ -296,16 +313,16 @@ impl Authority {
             // Everything the integrator reads back is on the wire, so a sidecar
             // restart is invisible to the driver: they keep their position,
             // their momentum and their lap.
-            let resumed = conn
+            let row = conn
                 .db
                 .car_state()
                 .car_id()
                 .find(&car.car_id)
-                .filter(|st| st.tick > 0)
-                .map(|st| {
-                    self.world.adopt(slot, from_row(&st));
-                    st.tick
-                });
+                .filter(|st| st.tick > 0);
+            let resumed = row.as_ref().map(|st| {
+                self.world.adopt(slot, from_row(st));
+                st.tick
+            });
             if resumed.is_none() {
                 let grid = self.next_grid % MAX_CARS;
                 self.next_grid += 1;
@@ -315,6 +332,7 @@ impl Authority {
                 car_id: car.car_id,
                 is_bot: car.is_bot,
                 brain: car.is_bot.then(|| BotBrain::new(car.car_id.wrapping_mul(2654435761))),
+                current: row.as_ref().map(input_from_row).unwrap_or_default(),
                 ..Default::default()
             });
             println!(
@@ -423,11 +441,25 @@ impl Authority {
                 continue;
             }
             let c = &self.world.cars[slot];
+            // The controls that produced this pose, so a client can carry the
+            // car forward on them instead of guessing an arc.
+            //
+            // Read from the world rather than from `Slot.current`, which is
+            // only half the grid: a bot's pedals are pressed by [`drive_bots`]
+            // a moment ago and never pass through the input queue at all.
+            // `world.inputs[slot]` is what both kinds of driver ended up with,
+            // and `world.step` does not touch it, so it still says what the
+            // tick being published was run on.
+            let i = &self.world.inputs[slot];
             states.push(CarState {
                 car_id: s.car_id,
                 slot: slot as u32,
                 tick: self.world.tick,
                 ack_seq: s.ack_seq,
+                in_throttle: i.throttle,
+                in_steer: i.steer,
+                in_brake: i.brake,
+                in_handbrake: i.handbrake > 0.5,
                 x: c.x,
                 y: c.y,
                 heading: c.heading,

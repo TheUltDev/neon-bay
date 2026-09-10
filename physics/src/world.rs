@@ -1,13 +1,23 @@
 //! The simulated world: N cars, the circuit, collisions and lap bookkeeping.
 //!
 //! [`World::step`] takes a *simulation mask*. Cars whose bit is set are
-//! integrated; cars whose bit is clear are treated as immovable colliders. That
-//! single knob is what lets the same code run in two very different roles:
+//! integrated; cars whose bit is clear are treated as immovable colliders.
 //!
-//! * the sidecar steps with every car in the mask -- it is the authority;
-//! * the browser steps with only the local player in the mask, and parks the
-//!   other cars at their interpolated network positions, so you can still lean
-//!   on a rival mid-corner without the client ever claiming to own their state.
+//! Both processes normally pass the whole grid. The sidecar does because it is
+//! the authority and every car's state is its to write. The browser does
+//! because it predicts the rest of the field rather than interpolating it: it
+//! seeds each rival from that car's newest snapshot and carries it forward on
+//! the controls the authority published with it, which is a far better guess
+//! than any extrapolation of a pose can be -- see `examples/predict.rs`.
+//!
+//! The mask says which cars are being *integrated*, and nothing about who owns
+//! them. On the browser those used to be the same set, which is why some of
+//! what follows used to talk about ownership; a client that predicts a rival
+//! integrates a car it does not own, and should, because the authority is
+//! integrating that same car from the same state with the same code. What a
+//! clear bit is for is a car there is nothing to integrate *from*: one no
+//! snapshot has arrived for yet, which is solid but has no state worth
+//! advancing.
 
 use crate::car::{self, CarInput, CarState, BOUND_R, HALF_LEN, HALF_WID, INV_MASS, IZ, MASS};
 use crate::collide::{self, Body, Constraint, Manifold, Obb};
@@ -193,23 +203,20 @@ impl World {
             barrier[i] = self.sample_barriers(i);
         }
 
-        // How fast the cars this process does *not* own are travelling, for the
-        // length of this tick, so that being hit can change it.
+        // How fast the cars outside the mask are travelling, for the length of
+        // this tick, so that being hit can change it.
         //
-        // Their state is not ours to write and stays exactly as it was; this is
-        // a scratch copy that lives for one tick and is thrown away. Without it
-        // a client hits a rival that never reacts, and the same contact fires
-        // again on every one of the eight substeps, each pass pulling the local
-        // car further towards a velocity the rival is no longer travelling at.
-        // With it the contact is over after the substep that resolved it, which
-        // is what happens on the authority.
+        // Their state is not being advanced and stays exactly as it was; this
+        // is a scratch copy that lives for one tick and is thrown away. Without
+        // it a car hits one of them and it never reacts, so the same contact
+        // fires again on every one of the eight substeps, each pass pulling the
+        // moving car further towards a velocity the other is no longer
+        // travelling at. With it the contact is over after the substep that
+        // resolved it.
         //
-        // Worth measuring rather than assuming: while the rival's pose is
-        // current it is worth nothing at all, because a nearly plastic impact
-        // leaves two equal cars at the same speed and the snapshot is already
-        // showing it. It earns its keep when the pose is stale -- 10.7 m/s of
-        // error against 13.0 at a three-tick-old snapshot and 30 m/s of closing
-        // speed -- which is the condition this has to survive.
+        // Empty whenever the mask is the whole grid, which is what both
+        // processes normally pass. It is what a car that has been heard of but
+        // not yet heard *from* gets.
         let mut ghost = [(V2::ZERO, 0.0f32); MAX_CARS];
         for i in slots(self.active & !mask) {
             ghost[i] = (self.cars[i].vel(), self.cars[i].omega);
@@ -319,8 +326,9 @@ impl World {
     }
 
     /// Body-vs-body contact between two cars. `a_dyn`/`b_dyn` say which of them
-    /// this process owns; the other one's *position* is not ours to move, and
-    /// its velocity is borrowed from `ghost` for the length of the tick.
+    /// this tick is integrating; the other one's *position* is not being
+    /// advanced, and its velocity is borrowed from `ghost` for the length of
+    /// the tick.
     fn resolve_pair(
         &mut self,
         i: usize,
@@ -345,25 +353,17 @@ impl World {
             None => return,
         };
 
-        // Both cars weigh what they weigh, whether or not this process owns
+        // Both cars weigh what they weigh, whether or not this tick is moving
         // them.
         //
-        // A car this process may not *move* is not a car that weighs nothing,
-        // and the two are easy to confuse. The browser simulates only the local
-        // car, so it used to hand every rival infinite mass -- and an infinite
-        // mass returns the whole impulse, so you rebounded off a car you should
-        // have shoved out of the way. Giving the other car its real mass and
-        // then discarding its half of the answer costs nothing, because the
-        // authority's answer for that car is already in flight, and it makes
-        // the impulse the client predicts *for itself* the one the sidecar
+        // A car that may not *move* is not a car that weighs nothing, and the
+        // two are easy to confuse. The browser used to simulate only the local
+        // car, so it handed every rival infinite mass -- and an infinite mass
+        // returns the whole impulse, so you rebounded off a car you should have
+        // shoved out of the way. Giving the other car its real mass and then
+        // discarding its half of the answer costs nothing, and it makes the
+        // impulse computed *for the car being integrated* the one the authority
         // computed rather than one that happens to land nearby.
-        //
-        // How much that is worth depends entirely on how fresh the rival's pose
-        // is, and it is worth saying so: with it predicted onto the current
-        // tick the two treatments agree to a few hundredths, because a plastic
-        // impact leaves two equal cars at the same speed either way. Against a
-        // rival six ticks old at 20 m/s of closing speed, real mass is 9.4 m/s
-        // and 3.97 m out where infinite mass is 10.2 m/s and 4.13 m.
         let (va, wa) = if a_dyn { (ca.vel(), ca.omega) } else { ghost[i] };
         let (vb, wb) = if b_dyn { (cb.vel(), cb.omega) } else { ghost[j] };
         let mut a = Body { pos: ca.pos(), vel: va, omega: wa, inv_m: INV_MASS, inv_i: 1.0 / IZ };
@@ -373,8 +373,12 @@ impl World {
         let hit = collide::solve(&mut a, &mut b, m.as_slice_mut(), CAR_FRICTION);
 
         // Pushing overlapping bodies apart, on the other hand, is a numerical
-        // repair and not a force -- so it may only move a car this process owns,
-        // and a client that owns one of the two therefore takes all of it.
+        // repair and not a force -- so it may only move a car this tick is
+        // integrating, and one that is integrating only one of the two takes
+        // all of it. When both are in the mask the push is split, which is what
+        // the authority does; a client predicting both of them wants exactly
+        // that, because the overlap it is repairing is the one the authority is
+        // repairing the same way.
         a.inv_m = if a_dyn { INV_MASS } else { 0.0 };
         b.inv_m = if b_dyn { INV_MASS } else { 0.0 };
         collide::separate(&mut a, &mut b, m.as_slice());
@@ -399,8 +403,8 @@ impl World {
             car.impact += hit.severity();
             crush(car, m.as_slice(), &hit, damage::SHARE_CAR, -1.0);
         }
-        // What the hit did to a car we do not own, remembered until the end of
-        // the tick and no longer. The next snapshot is the truth about it.
+        // What the hit did to a car this tick is not integrating, remembered
+        // until the end of the tick and no longer.
         if !a_dyn {
             ghost[i] = (a.vel, collide::clamp_spin(a.omega, MAX_SPIN));
         }

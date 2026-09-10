@@ -447,6 +447,215 @@ stuck ticks {stuck_ticks}, worst wall overshoot {worst_overshoot:.2} m");
         w
     }
 
+    /// Two cars queued nose to tail on the racing line, `gap` metres apart
+    /// along it, the one behind closing at `closing` m/s.
+    ///
+    /// Along the centreline rather than along a straight tangent, unlike
+    /// [`shunt`], so the queue can be long enough that the client has taken
+    /// delivery of a dozen snapshots before the contact. Without that the test
+    /// below would be measuring a cold start rather than a prediction.
+    fn queue(closing: f32, gap: f32) -> World {
+        let mut w = World::new();
+        w.spawn(0, 0);
+        w.spawn(1, 1);
+        let start = w.track.nearest(w.cars[0].pos(), track::NO_HINT).s;
+        for (i, along, speed) in [(0usize, 0.0f32, closing + 20.0), (1, gap, 20.0)] {
+            let (p, tan, _) = w.track.sample(w.track.wrap_s(start + along));
+            w.cars[i].place(p, math::atan2(tan.y, tan.x));
+            w.cars[i].active = 1.0;
+            w.cars[i].vx = tan.x * speed;
+            w.cars[i].vy = tan.y * speed;
+            w.cars[i].sync_drivetrain();
+            let hit = w.track.nearest(p, track::NO_HINT);
+            w.cars[i].seg = hit.idx as f32;
+            w.cars[i].s = hit.s;
+            w.cars[i].lat = hit.lat;
+        }
+        w
+    }
+
+    /// Park a rival the way the browser used to.
+    ///
+    /// `Sim.placeRemote` was the whole of what a client would write into a car
+    /// it does not own, so this is the list, and the list is load-bearing: the
+    /// contact solver borrows a ghost car's velocity *and* its yaw rate for the
+    /// length of a tick, and a contact point is `v + omega x r`. A rival parked
+    /// without `omega` is a car that cornering does not rotate, which is worth
+    /// over a metre a second of closing speed at the bodywork.
+    fn park(ghost: &mut CarState, from: &CarState) {
+        ghost.x = from.x;
+        ghost.y = from.y;
+        ghost.heading = from.heading;
+        ghost.vx = from.vx;
+        ghost.vy = from.vy;
+        ghost.omega = from.omega;
+        ghost.active = 1.0;
+    }
+
+    /// The record as it reaches the browser.
+    ///
+    /// `slip_f`, `slip_r`, `impact` and `wall` are the four fields of it that
+    /// are not on the wire. Each is written before it is next read, so dropping
+    /// them is exact rather than approximate -- and a test that quietly handed
+    /// them over would be doing the client a favour it never gets.
+    fn from_wire(c: &CarState) -> CarState {
+        CarState { slip_f: 0.0, slip_r: 0.0, impact: 0.0, wall: 0.0, ..*c }
+    }
+
+    /// Carry a pose forward at a constant turn rate: what `predict()` in
+    /// `net.ts` does for a car it has nothing better to go on for.
+    fn extrapolate(c: &CarState, dt: f32) -> CarState {
+        let w = c.omega;
+        let th = w * dt;
+        let straight = math::abs(w) < 1e-3;
+        let s = if straight { dt } else { math::sin(th) / w };
+        let k = if straight { 0.0 } else { (1.0 - math::cos(th)) / w };
+        let (cs, sn) = (math::cos(th), math::sin(th));
+        CarState {
+            x: c.x + c.vx * s - c.vy * k,
+            y: c.y + c.vx * k + c.vy * s,
+            heading: c.heading + th,
+            vx: c.vx * cs - c.vy * sn,
+            vy: c.vx * sn + c.vy * cs,
+            ..*c
+        }
+    }
+
+    /// How a browser places the car it does not own.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Rival {
+        /// Parked at a constant-turn-rate extrapolation of its newest snapshot:
+        /// solid, never integrated, and with no idea what its driver is doing.
+        Parked,
+        /// Seeded from that snapshot and stepped on the controls the authority
+        /// published with it, held until the next one arrives.
+        Stepped,
+    }
+
+    /// One approach: two cars closing, both drivers doing something.
+    struct Scene {
+        what: &'static str,
+        closing: f32,
+        gap: f32,
+        /// What both drivers are doing with the wheel. The same, because they
+        /// are going through the same piece of road.
+        steer: f32,
+        /// What the car in front does with its brake, given how much clear air
+        /// is left behind it. Triggered on the gap rather than on the clock, so
+        /// that "at the last moment" stays the last moment when the approach
+        /// speed changes.
+        brake: fn(f32) -> f32,
+    }
+
+    impl Scene {
+        fn mine(&self) -> CarInput {
+            CarInput { steer: self.steer, ..Default::default() }
+        }
+        fn rival(&self, gap: f32) -> CarInput {
+            CarInput { steer: self.steer, brake: (self.brake)(gap), ..Default::default() }
+        }
+    }
+
+    /// Ticks between snapshots, as the sidecar publishes them: 60 Hz / 3.
+    const SNAP_EVERY: u64 = 3;
+    /// Ticks the client is running ahead of the authority -- a 300 ms round
+    /// trip, plus the margin the clock sync holds on top.
+    ///
+    /// The whole difficulty lives in this number. At zero lead every scheme is
+    /// exact, because the snapshot *is* the answer; the question is only ever
+    /// what to do with the ten ticks after it.
+    const LEAD: u64 = 9;
+    /// Ticks to keep running after the contact, so it has finished playing out
+    /// before the answer is read.
+    const SETTLE: i32 = 12;
+
+    /// Run one approach twice: on the authority, and on a client `LEAD` ticks
+    /// ahead of it taking the authority's snapshots at 20 Hz and placing the
+    /// rival the given way.
+    ///
+    /// Returns the *worst* the client's account of its own car ever got, in
+    /// metres and in m/s.
+    ///
+    /// The worst rather than the last, deliberately. A client that rolls back
+    /// converges on the authority within a snapshot of anything: measure after
+    /// the news has landed and every scheme scores zero, because what is being
+    /// measured is then the correction rather than the prediction. The peak is
+    /// what the driver actually experienced -- how far the car was from where
+    /// the authority was going to say it was, at the moment they were looking
+    /// at it -- and it is also, exactly, the size of the yank that followed.
+    fn approach(sc: &Scene, style: Rival) -> (f32, f32) {
+        let mut authority = queue(sc.closing, sc.gap);
+        let mut client = queue(sc.closing, sc.gap);
+        let mask = if style == Rival::Stepped { 0b11 } else { 0b01 };
+        // Everything the authority has published, by tick: both cars, and the
+        // controls the rival's pose was computed on. Only every third entry is
+        // ever read, and keeping them all is simpler than a ring buffer.
+        let opening = sc.rival(sc.gap);
+        let mut published = vec![(client.cars[0], client.cars[1], opening)];
+        if style == Rival::Stepped {
+            client.inputs[1] = opening;
+        }
+        let mut applied = 0u64;
+        let mut settling = -1i32;
+        let (mut worst_pos, mut worst_speed) = (0.0f32, 0.0f32);
+
+        for _ in 0..600 {
+            let t = authority.tick;
+            let held = sc.rival(authority.cars[1].pos().sub(authority.cars[0].pos()).len());
+            authority.inputs[0] = sc.mine();
+            authority.inputs[1] = held;
+            authority.step(0b11);
+            published.push((authority.cars[0], authority.cars[1], held));
+
+            // The newest snapshot old enough to have arrived.
+            let seen = authority.tick.saturating_sub(LEAD);
+            let snap = seen - seen % SNAP_EVERY;
+            if snap > applied {
+                applied = snap;
+                let (mine, theirs, held) = published[snap as usize];
+                client.cars[0] = from_wire(&mine);
+                client.tick = snap;
+                if style == Rival::Stepped {
+                    client.cars[1] = from_wire(&theirs);
+                    client.inputs[1] = held;
+                }
+                // Rewind, and replay to where the client already was.
+                for u in snap..t {
+                    client.inputs[0] = sc.mine();
+                    if style == Rival::Parked {
+                        park(&mut client.cars[1], &extrapolate(&theirs, (u - snap) as f32 * DT));
+                    }
+                    client.step(mask);
+                }
+            }
+            client.inputs[0] = sc.mine();
+            if style == Rival::Parked {
+                let theirs = published[applied as usize].1;
+                park(&mut client.cars[1], &extrapolate(&theirs, (t - applied) as f32 * DT));
+            }
+            client.step(mask);
+
+            // Both worlds are now at the same tick, and the authority's answer
+            // for it will not reach the client for another [`LEAD`] ticks. The
+            // gap between them is what the driver is looking at.
+            let apart = client.cars[0].pos().sub(authority.cars[0].pos()).len();
+            let dv = client.cars[0].forward_speed() - authority.cars[0].forward_speed();
+            worst_pos = math::max(worst_pos, apart);
+            worst_speed = math::max(worst_speed, math::abs(dv));
+
+            if settling >= 0 {
+                settling += 1;
+                if settling >= SETTLE {
+                    break;
+                }
+            } else if authority.cars[0].impact > 1.0 {
+                settling = 0;
+            }
+        }
+        assert!(settling >= 0, "{}: the two cars never touched", sc.what);
+        (worst_pos, worst_speed)
+    }
+
     /// A car-to-car impact is mostly plastic, and more so the harder it is.
     ///
     /// This is the difference between a race and a game of pool. The old model
@@ -480,43 +689,69 @@ stuck ticks {stuck_ticks}, worst wall overshoot {worst_overshoot:.2} m");
         }
     }
 
-    /// The one a browser cares about: the client owns one car and takes the
-    /// other from the network, and it has to arrive at the sidecar's answer for
-    /// its own car anyway.
+    /// The one a browser cares about: the client owns one car, gets the other
+    /// from the network a round trip late, and has to arrive at the sidecar's
+    /// answer for its own car anyway.
     ///
-    /// It did not used to. A client cannot move a car it does not own, so it
-    /// gave rivals infinite mass -- and an infinite mass returns the entire
-    /// impulse. You rebounded off a car you should have shoved, and then the
-    /// authority's snapshot dragged you back through it.
+    /// The rival is *doing something* through the approach in most of these,
+    /// which is the whole point. A car travelling in a straight line is a car
+    /// any extrapolation can follow; a car braking, or leaning on the wheel, or
+    /// lifting at the last moment, is not, and those are the moments a contact
+    /// actually happens in. Both columns are printed because the improvement is
+    /// the argument: the left is what parking a rival at an extrapolated pose
+    /// got you, the right is what carrying it forward through the physics on
+    /// the controls the authority published gets you instead.
     #[test]
     fn a_client_predicts_the_hit_the_authority_resolves() {
-        println!("  closing   authority   client   error");
-        for closing in [6.0f32, 20.0] {
-            let mut authority = shunt(closing);
-            let mut client = shunt(closing);
-            let mut hit_at = -1i32;
-            while hit_at < 12 {
-                authority.step(0b11);
-                // The rival's snapshot for this tick. `net.ts` interpolates
-                // remote cars up to the current tick, so this is what a client
-                // really has, not a favour to it.
-                client.cars[1] = authority.cars[1];
-                client.step(0b01);
-                if hit_at >= 0 {
-                    hit_at += 1;
-                } else if authority.cars[0].impact > 1.0 {
-                    hit_at = 0;
-                }
-            }
-            let (a, c) = (authority.cars[0].forward_speed(), client.cars[0].forward_speed());
-            let apart = client.cars[0].pos().sub(authority.cars[0].pos()).len();
-            println!("  {closing:5.0} m/s   {a:6.2} m/s   {c:5.2} m/s   {:.2} m/s, {apart:.3} m", c - a);
-            assert!(
-                math::abs(c - a) < 1.5,
-                "client predicted {c:.2} m/s where the authority resolved {a:.2}"
+        let scenes = [
+            Scene { what: "travelling", closing: 20.0, gap: 24.0, steer: 0.0, brake: |_| 0.0 },
+            Scene { what: "braking hard", closing: 14.0, gap: 20.0, steer: 0.0, brake: |_| 1.0 },
+            Scene { what: "leaning on the wheel", closing: 14.0, gap: 20.0, steer: 0.25, brake: |_| 0.0 },
+            Scene { what: "braking mid-corner", closing: 12.0, gap: 18.0, steer: 0.25, brake: |_| 1.0 },
+            // The one held input cannot know about until a snapshot says so,
+            // and the honest limit of the scheme: for the ten ticks the news
+            // takes to arrive the client is carrying a rival that is not
+            // braking, because a tick ago it was not.
+            Scene { what: "braking late", closing: 20.0, gap: 24.0, steer: 0.0, brake: |gap| if gap < 6.0 { 1.0 } else { 0.0 } },
+        ];
+        // A zero in the right-hand column is not a rounded zero. When a driver
+        // holds an input -- which is what a driver mostly does -- the client
+        // re-runs the authority's own arithmetic on the authority's own numbers
+        // and lands on the same bits, so there is nothing left to be out by.
+        // The last row is where the scheme actually costs something: a car that
+        // changes its mind inside the round trip cannot be followed, only
+        // corrected, and five centimetres is what that costs here.
+        println!("  worst the client was ever out by, on its own car:");
+        println!("  the rival is...            parked ghost        stepped rival");
+        let mut worst = 0.0f32;
+        for sc in &scenes {
+            let (parked, parked_v) = approach(sc, Rival::Parked);
+            let (stepped, stepped_v) = approach(sc, Rival::Stepped);
+            println!(
+                "  {:<24} {parked:5.2} m {parked_v:6.2} m/s   {stepped:5.2} m {stepped_v:6.2} m/s",
+                sc.what
             );
-            assert!(apart < 0.5, "client's car ended up {apart:.2} m from the authority's");
+            worst = math::max(worst, stepped);
+            assert!(
+                stepped < 0.25,
+                "{}: client's car was {stepped:.2} m from the authority's",
+                sc.what
+            );
+            assert!(
+                stepped_v < 1.0,
+                "{}: client was {stepped_v:.2} m/s off the authority through the hit",
+                sc.what
+            );
+            // Not "better on average": better every time. An extrapolated pose
+            // has no way to be right about a car whose driver is doing
+            // anything, so there should be no scenario here it wins.
+            assert!(
+                stepped <= parked,
+                "{}: stepping the rival was worse than parking it ({stepped:.2} m vs {parked:.2} m)",
+                sc.what
+            );
         }
+        println!("  worst {worst:.3} m");
     }
 
     /// Damage has to be simulation state, not decoration: replaying from a

@@ -11,18 +11,26 @@ import type {
   Config as ConfigRow,
 } from './module_bindings/types';
 import { Identity } from 'spacetimedb';
-import { F, wrapPi } from './sim';
+import { F, wrapPi, type RivalState } from './sim';
 
 export interface Snapshot {
   tick: number;
   /** Full CarState record, ready to hand straight to the wasm sim. */
   state: Float32Array;
+  /** The four controller channels the authority was applying as it computed
+   *  that state. Kept beside the record rather than in it: they are inputs,
+   *  not state, and the wasm world takes them through a separate buffer. */
+  input: Float32Array;
   ackSeq: number;
   /** performance.now() when this landed, for latency estimation. */
   received: number;
 }
 
-/** Everything known about one car this client does not simulate. */
+/** Everything the network knows about one car this client does not own.
+ *
+ *  A driving client keeps its own running prediction of that car in the wasm
+ *  world and draws from there; this is what seeds it, and what a spectator --
+ *  who has no world of their own to seed -- draws from directly. */
 interface Remote {
   /** Authoritative poses, oldest first. */
   snaps: Snapshot[];
@@ -114,8 +122,9 @@ export class Net {
   cars = new Map<number, CarMeta>();
   /** car_id -> the poses and prediction state for a car this client watches. */
   remotes = new Map<number, Remote>();
-  /** The tick this client is currently simulating and drawing, which is what
-   *  remote cars are predicted to. Written once a frame by the render loop. */
+  /** The tick this client is currently simulating and drawing. Written once a
+   *  frame by the render loop, and read by [`absorb`] to work out how far out
+   *  the last extrapolation was at the moment the news landed. */
   viewTick = 0;
   myCarId = 0;
   mySlot = -1;
@@ -146,10 +155,11 @@ export class Net {
   netSim: NetSim = { latencyMs: 0, jitterMs: 0, lossPct: 0 };
   droppedInputs = 0;
 
-  /** Scratch for `sampleRemote`. A full grid sampled on every fixed step is a
-   *  couple of hundred short-lived typed arrays a frame, which Firefox collects
-   *  as visible hitches; every caller reads the result out before asking for
-   *  the next one, so one buffer does. */
+  /** Scratch for `sampleRemote`. A full grid sampled once a frame, plus once
+   *  per car per snapshot for [`absorb`], is a couple of hundred short-lived
+   *  typed arrays a second, which Firefox collects as visible hitches; every
+   *  caller reads the result out before asking for the next one, so one buffer
+   *  does. */
   // Sized from `F` rather than a literal, so growing the record -- as adding
   // four wheels, four tire forces and a drivetrain to it did -- cannot leave a
   // scratch buffer behind that silently overruns on the first remote car.
@@ -485,6 +495,12 @@ export class Net {
     const snap: Snapshot = {
       tick,
       state: this.toRecord(row),
+      input: Float32Array.of(
+        row.inThrottle,
+        row.inSteer,
+        row.inBrake,
+        row.inHandbrake ? 1 : 0,
+      ),
       ackSeq: row.ackSeq,
       received: performance.now(),
     };
@@ -619,29 +635,39 @@ export class Net {
   }
 
   /**
-   * Where a remote car is at `atTick`, on this client's clock.
-   *
-   * Not "where it was 70 ms ago", which is what an interpolation buffer would
-   * give you. The local car is predicted several ticks
-   * into the *future* -- far enough ahead that its input arrives before the
-   * authority needs it -- so a rival drawn from the past is a rival in the
-   * wrong place: metres behind where the authority will resolve the contact,
-   * at racing speed. Carrying the newest snapshot forward to the tick actually
-   * being simulated puts every car on one clock, and it is the clock the
-   * authority used. What it costs is a guess, and [`absorb`] fades away the
-   * difference between the guess and the snapshot that settles it.
+   * Every car this client does not own, as the authority last described it:
+   * the record to seed its slot from, and the controls to carry it forward on
+   * until the next snapshot arrives. See [`Sim.reconcile`].
    */
-  predictRemote(carId: number, atTick: number): Float32Array | null {
-    const r = this.remotes.get(carId);
-    if (!r || r.snaps.length === 0) return null;
-    return this.predict(r, atTick);
+  rivals(): RivalState[] {
+    const out: RivalState[] = [];
+    for (const meta of this.cars.values()) {
+      if (meta.carId === this.myCarId) continue;
+      const r = this.remotes.get(meta.carId);
+      if (!r || r.snaps.length === 0) continue;
+      const snap = r.snaps[r.snaps.length - 1];
+      out.push({ slot: meta.slot, state: snap.state, input: snap.input });
+    }
+    return out;
   }
 
   /**
-   * The same pose with the last correction still fading out of it: what to
-   * *draw*. The physics gets [`predictRemote`] instead, because the residual is
-   * an apology for a guess that has already been corrected, and re-introducing
-   * it would only make the next collision disagree with the authority again.
+   * Where a remote car is at `atTick`, on this client's clock, with the last
+   * correction still fading out of it.
+   *
+   * This is the spectator's view, and the one moment before a car has been
+   * heard from. A client that is driving simulates the whole grid instead --
+   * see [`Sim.step`] -- and draws every car from its own slot, because what
+   * you see and what you can lean on had better be the same arrangement of
+   * cars.
+   *
+   * Deliberately not "where it was 70 ms ago", which is what an interpolation
+   * buffer would give you. The local car is predicted several ticks into the
+   * *future* -- far enough ahead that its input arrives before the authority
+   * needs it -- so a rival drawn from the past is a rival in the wrong place:
+   * metres behind where the authority will resolve the contact, at racing
+   * speed. Carrying the newest snapshot forward to the tick actually being
+   * drawn puts every car on one clock, and it is the clock the authority used.
    */
   sampleRemote(carId: number, atTick: number): Float32Array | null {
     const r = this.remotes.get(carId);
@@ -660,12 +686,19 @@ export class Net {
   /**
    * The pose the buffer implies at `atTick`, written into the shared scratch.
    *
-   * Between snapshots this interpolates. Past the newest one -- which is where
-   * the client normally is, being ahead of the authority -- it carries the car
-   * forward at a constant turn rate: a car mid-corner keeps turning, so
-   * rotating its velocity as it goes follows the arc instead of flying off the
-   * tangent. Over the ten-odd ticks of lead that is the difference between
-   * centimetres of error and half a metre.
+   * Between snapshots this interpolates, which is where a spectator normally
+   * sits: their clock is the authority's, so there is usually a snapshot on
+   * either side of it. Past the newest one it carries the car forward at a
+   * constant turn rate -- a car mid-corner keeps turning, so rotating its
+   * velocity as it goes follows the arc instead of flying off the tangent.
+   *
+   * That extrapolation used to be how *every* rival was placed, on a client
+   * running a round trip ahead of the authority, and it is the thing the
+   * simulated grid replaced: measured over eight bots at two hundred
+   * milliseconds of lead, it is out by 0.35 m at the 99th percentile against
+   * 0.06 m for carrying the same car forward through the physics on the
+   * controls the authority published with it. See
+   * `physics/examples/predict.rs`.
    */
   private predict(r: Remote, atTick: number): Float32Array {
     const buf = r.snaps;

@@ -8,10 +8,10 @@
 //!    metal that bends does not give the energy back, so the separation speed
 //!    should be a small fraction of the closing speed and should get smaller as
 //!    the closing speed rises.
-//! 2. **Does the client predict the same hit the authority resolves?** The
-//!    browser only simulates its own car. What it assumes about the mass of the
-//!    car it just hit decides whether its prediction is nearly right or
-//!    completely wrong, and the driver feels the difference immediately.
+//! 2. **Does the client predict the same hit the authority resolves?** What the
+//!    browser assumes about the car it just hit -- its mass, and whether the
+//!    contact is allowed to move it -- decides whether its prediction is nearly
+//!    right or completely wrong, and the driver feels the difference at once.
 //! 3. **Does the contact resolve before it is deep?** Penetration that is
 //!    allowed to get large picks the wrong separating axis and is then pushed
 //!    out along it.
@@ -65,8 +65,9 @@ fn kinetic(c: &CarState) -> f32 {
 /// drag and rolling resistance take more energy out of two cars in a second
 /// than a moderate shunt does, and they are not what is being asked about.
 ///
-/// `mask` is what gets simulated: `0b11` is the sidecar, which owns both cars,
-/// and `0b01` is the browser, which owns one and treats the other as scenery.
+/// `mask` is what gets integrated: `0b11` is both cars, which is what the
+/// sidecar and the browser now both pass, and `0b01` is one car with the other
+/// as scenery, which is what the browser used to.
 fn run(gap: f32, closing: f32, lead_speed: f32, mask: u32) -> Report {
     let (mut w, fwd) = stage(gap, closing, lead_speed);
     let coast = CarInput::default();
@@ -132,13 +133,26 @@ fn rear_end() {
     }
 }
 
-/// The same hit, resolved by the sidecar and predicted by a browser.
+/// The same hit, resolved by the sidecar and predicted by a browser, both ways
+/// a browser has had of doing it.
 ///
-/// The browser runs one car and takes everyone else from the network, so the
-/// client world here simulates car 0 only and overwrites car 1 from the
-/// authority every tick -- a perfect, zero-latency feed, which is the right
-/// control: whatever error is left is the client's own physics disagreeing
-/// about the contact, not the connection.
+/// Both clients are fed the authority's car 1 for the current tick, every tick:
+/// a perfect, zero-latency feed. That is the control, and it is the whole point
+/// of the comparison -- with the connection taken out of it, what is left is the
+/// client's own arithmetic disagreeing about the contact. How much a *stale*
+/// snapshot costs on top is the netcode's question, and
+/// `physics::tests::a_client_predicts_the_hit_the_authority_resolves` is where
+/// it gets asked.
+///
+/// * **parked** simulates car 0 and leaves car 1 where the feed put it. What
+///   the browser used to do. The contact solver still gives the parked car its
+///   real mass -- it weighs what it weighs whoever is integrating it -- but the
+///   positional repair may not move it, so the client takes all of that shove
+///   itself and ends up somewhere the authority never put it.
+/// * **stepped** integrates both, which is what the browser does now that it
+///   predicts rivals through the physics rather than extrapolating their poses.
+///   Handed the same state the authority has, it does the same arithmetic on it
+///   and lands on the same bits, so the error is not small: it is absent.
 ///
 /// Reported a round trip after the hit, because that is when reconciliation
 /// arrives and takes the error away. Left to run, any difference at all keeps
@@ -146,31 +160,45 @@ fn rear_end() {
 fn client_vs_authority() {
     println!();
     println!("--- the same hit, as the sidecar resolves it and as a browser predicts it ---");
-    println!("  closing   authority   client   speed error   apart");
+    println!("  closing   authority   parked client       stepped client");
     for closing in [2.0f32, 6.0, 12.0, 20.0, 30.0] {
         let (mut a, fwd) = stage(6.0, closing, 20.0);
-        let (mut c, _) = stage(6.0, closing, 20.0);
+        let mut clients = [stage(6.0, closing, 20.0).0, stage(6.0, closing, 20.0).0];
+        let masks = [0b01u32, 0b11];
 
         let mut since_hit = -1i32;
         while since_hit < 12 {
+            // The rival's snapshot for the tick the clients are about to step
+            // *from*, which is the one `placeRemotes` used to fetch and the one
+            // a reconcile seeds a slot with. Handing over the tick after would
+            // be a favour no browser gets -- and it is a favour that stayed
+            // invisible for as long as the rival was scenery, because scenery
+            // does not care which tick it is standing in.
+            for c in clients.iter_mut() {
+                c.cars[1] = a.cars[1];
+            }
             a.step(0b11);
-            // The rival's snapshot for this tick, before the client steps: the
-            // netcode interpolates remote cars up to the current tick, so a
-            // client is not a tick behind on where they are.
-            c.cars[1] = a.cars[1];
-            c.step(0b01);
+            for (c, mask) in clients.iter_mut().zip(masks) {
+                c.step(mask);
+            }
             if since_hit >= 0 {
                 since_hit += 1;
             } else if a.cars[0].impact > 1.0 {
                 since_hit = 0;
             }
         }
-        let worst_pos = c.cars[0].pos().sub(a.cars[0].pos()).len();
+        let cell = |c: &World| {
+            format!(
+                "{:6.2} m/s {:5.2} m",
+                along(c, 0, fwd) - along(&a, 0, fwd),
+                c.cars[0].pos().sub(a.cars[0].pos()).len(),
+            )
+        };
         println!(
-            "  {closing:5.0} m/s   {:6.2} m/s   {:5.2} m/s   {:7.2} m/s   {worst_pos:5.2} m",
+            "  {closing:5.0} m/s   {:6.2} m/s   {}   {}",
             along(&a, 0, fwd),
-            along(&c, 0, fwd),
-            along(&c, 0, fwd) - along(&a, 0, fwd),
+            cell(&clients[0]),
+            cell(&clients[1]),
         );
     }
 }

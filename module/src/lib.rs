@@ -168,6 +168,29 @@ pub struct CarState {
     /// Last [`Input::seq`] from this car's owner that the sidecar had applied.
     pub ack_seq: u32,
 
+    /// And what that input *was*: the controller state the authority had its
+    /// hands on as this pose was computed.
+    ///
+    /// The one thing a client cannot derive. It owns the whole simulation and
+    /// can carry a rival forward through the same tires, the same load
+    /// transfer and the same drag the authority used -- but not knowing what
+    /// the other driver is doing with the pedals, it used to carry them
+    /// forward along an arc instead, which is a guess that goes wrong exactly
+    /// where it matters. Held for the length of the guess, this is worth an
+    /// order of magnitude at the tail; see `physics/examples/predict.rs`.
+    ///
+    /// Not a leak of [`Input`]: that table is private because reading a
+    /// rival's controls a few milliseconds *before* they take effect is
+    /// reading their mind. This is the same reading a few milliseconds after,
+    /// alongside the pose it already produced, which is a replay.
+    ///
+    /// Bots have no `Input` row at all -- their pedals are pressed inside the
+    /// sidecar -- and this is the only place their controls appear.
+    pub in_throttle: f32,
+    pub in_steer: f32,
+    pub in_brake: f32,
+    pub in_handbrake: bool,
+
     pub x: f32,
     pub y: f32,
     pub heading: f32,
