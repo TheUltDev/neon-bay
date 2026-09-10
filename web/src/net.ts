@@ -452,7 +452,7 @@ export class Net {
   }
 
   /**
-   * Turn a row into the exact 44-float record the wasm simulation uses.
+   * Turn a row into the exact 46-float record the wasm simulation uses.
    *
    * Positional, in `F` order -- the same `#[repr(C)]` layout the sim maps over
    * wasm memory. Nearly all of it is simulation state rather than pose, and it
@@ -477,6 +477,7 @@ export class Net {
       row.bestLap, row.impact, row.wall ? 1 : 0,
       row.dmgFront, row.dmgRear, row.dmgLeft, row.dmgRight,
       1,
+      row.pedal, row.brakePedal,
     );
   }
 

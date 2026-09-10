@@ -8,15 +8,17 @@
 //!    that plus the body's attitude means for the load on each tire;
 //! 3. work out where each contact patch is going, hand it to [`crate::wheel`],
 //!    and get a force back from [`crate::tire`];
-//! 4. put the drivetrain's torque into the rear wheels ([`crate::drivetrain`]);
+//! 4. step the engine and the rear axle together ([`crate::drivetrain`]) and
+//!    the front wheels on their own;
 //! 5. sum the four forces and moments and integrate the body.
 //!
 //! What comes out is not a car that has been *told* how to behave. Understeer,
 //! power oversteer, lift-off oversteer, lock-up, wheelspin, engine braking and
 //! the way all of them change with speed are consequences of those five steps,
 //! not cases in a list. The one place the model deliberately stops being a
-//! simulation is [`steer_lock`], which is an input aid for people driving with
-//! a keyboard rather than a steering wheel.
+//! simulation is the steering aid, [`steer_lock`] and [`steer_aid`], which
+//! stands in for the wheel and the hands that people driving with a keyboard
+//! do not have.
 //!
 //! Everything is plain `f32` and every transcendental comes from
 //! [`crate::math`], so the sidecar (x86-64) and the browser (wasm32) produce
@@ -24,11 +26,11 @@
 
 use crate::aero;
 use crate::damage::Damage;
-use crate::drivetrain::{self, Drivetrain};
+use crate::drivetrain::{self, Driven, Drivetrain};
 use crate::math::{abs, atan, clamp, max, min, tan, V2};
 use crate::suspension::{self, Attitude};
 use crate::tire;
-use crate::wheel::{self, Contact, Wheel};
+use crate::wheel::{self, Contact, Patch, Wheel};
 
 /// Simulation rate. Both the sidecar and the client advance at exactly this.
 pub const TICK_HZ: u32 = 60;
@@ -85,6 +87,40 @@ const STEER_RATE: f32 = 5.0;
 /// How much of full Ackermann the steering geometry has. Real racks are
 /// partial, so the inner wheel takes some extra angle but not all of it.
 const ACKERMANN: f32 = 0.65;
+
+/// Yaw damping in the steering aid: road-wheel angle per rad/s of body-slip
+/// rate, capped at the lock the driver has. See [`steer_aid`].
+const YAW_DAMP: f32 = 0.3;
+/// Speeds the aid fades in across, m/s: none of it below the first, all of it
+/// above the second. Below walking pace the body-slip rate is noise.
+const AID_FADE: (f32, f32) = (3.0, 6.0);
+/// Rear slip angles, radians, across which the aid decides the rear has let
+/// go: nothing below the first, a slide above the second. The lateral peak is
+/// at seven to nine degrees depending on load, and a steady corner at the
+/// limit holds the rear at five.
+const SLIDE: (f32, f32) = (0.14, 0.21);
+/// Body slip angles, radians, across which the aid decides the car is
+/// sideways. No steady corner at any speed puts more than five degrees
+/// between where the car points and where it goes; a car being caught from a
+/// slide has ten or more the whole way back, including the moment the rear
+/// slip passes through zero on its way to the other side.
+const SIDEWAYS: (f32, f32) = (0.10, 0.17);
+/// Body-slip rates, rad/s, across which the aid decides a slide is under way
+/// whatever the angles say. Turning in to a fast corner builds the rear's
+/// working slip angle at a quarter of a radian a second at most; a rear that
+/// has let go, or a car snapping back the other way, moves at two or three
+/// times that.
+const RATE: (f32, f32) = (0.35, 0.6);
+
+/// How fast the pedals travel, in full strokes per second: pressing, and
+/// letting go. A foot takes about a quarter of a second to floor a throttle
+/// and rather less to come off it; a brake pedal is shorter and faster. A key
+/// does both in one tick, and the difference is the whole of "I can't feed the
+/// power in out of a corner". See [`travel`].
+const THROTTLE_PRESS: f32 = 4.0;
+const THROTTLE_RELEASE: f32 = 12.0;
+const BRAKE_PRESS: f32 = 10.0;
+const BRAKE_RELEASE: f32 = 15.0;
 
 /// Grip left at the rear once the handbrake is pulled. Almost all of the effect
 /// is the tire model reacting to two locked wheels; this is the mechanical
@@ -199,10 +235,20 @@ pub struct CarState {
     pub dmg_right: f32,
 
     pub active: f32,
+
+    /// Where the pedals actually are, as opposed to where the driver is
+    /// asking them to be. The throttle is signed like the input, the brake
+    /// 0..1. Simulation state: a replay that started with the pedals somewhere
+    /// else would feed the engine a different torque for a quarter of a
+    /// second, which is the whole difference between a car that goes where it
+    /// went and one that does not. Last in the record so that nothing above
+    /// moves. See [`travel`].
+    pub pedal: f32,
+    pub brake_pedal: f32,
 }
 
 /// Number of `f32`s in [`CarState`]. Asserted against the real layout in tests.
-pub const CAR_FLOATS: usize = 44;
+pub const CAR_FLOATS: usize = 46;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -422,6 +468,82 @@ pub fn steer_lock(speed: f32) -> f32 {
     MAX_STEER / (1.0 + speed * 0.105)
 }
 
+/// The rest of the input aid: what stands in for the hands.
+///
+/// [`steer_lock`] caps how much slip angle a key can ask of the front tires.
+/// It was measured from straight ahead, which is right until the rear steps
+/// out. In a slide the front patches are no longer travelling along the body,
+/// and a rack that can only reach `lock` either side of straight ahead cannot
+/// reach *zero* front slip, never mind opposite lock: a second into a slide at
+/// 15 m/s the fronts needed 14 degrees of countersteer just to stop pushing
+/// the car round, and had 12.6. Every key the driver pressed either made it
+/// worse or made no difference, which is the report that led here.
+///
+/// Two terms fix that, and both are what a driver with a wheel does without
+/// thinking:
+///
+/// * **Opposite lock is measured from where the fronts are going.** Once the
+///   rear has let go -- its slip angle past the tire's peak, see [`SLIDE`] --
+///   and the front patches are travelling against the yaw, the input's lock
+///   is offset by that travel angle, in proportion to how much input there
+///   is. Full opposite lock then puts the fronts at `-lock` of slip relative
+///   to the road, which is the restoring force the taper was always meant to
+///   allow; and a key held *into* the slide unwinds towards straight ahead
+///   instead of pushing the car round at full saturation. It can unwind the
+///   driver's input to zero, never past it. The rear-slip gate matters: above
+///   the tangent speed a car cornering steadily has its nose pointed in and
+///   its fronts travelling a few degrees outward, and without the gate that
+///   read as a slide and cost the fast corners their lock.
+/// * **The rate of the slide is damped.** `omega - ay/u` is the rate at which
+///   the body slip angle is growing: zero in any steady corner at any speed,
+///   with no model of the car, and nonzero exactly while the rear is stepping
+///   out or coming back. A wheel angle against it is what unwinding the
+///   countersteer as the car comes straight *is*, and it is the part a
+///   keyboard cannot do at all -- with the rack unlocked and no damping, a
+///   driver reacting 250 ms late caught every slide and then spun the other
+///   way. Capped at the same lock the driver has, so the aid never has more
+///   authority than a key. And it only acts once the car is actually sideways
+///   ([`SIDEWAYS`]) or the rear has let go ([`SLIDE`]): turning in to a fast
+///   corner builds the rear's working slip angle, which is the same signal at
+///   a smaller size, and damping *that* blunted turn-in enough to put the bot
+///   drivers into the first wall.
+///
+/// Both fade out below walking pace, where the body-slip rate is noise.
+/// `u` and `w` are the body-frame velocity, `ay` and `slip_r` the previous
+/// substep's lateral acceleration and mean rear slip angle, `steer` the input
+/// and `lock` what [`steer_lock`] gives it.
+pub fn steer_aid(u: f32, w: f32, omega: f32, ay: f32, slip_r: f32, steer: f32, lock: f32) -> f32 {
+    let fade = clamp((u - AID_FADE.0) / (AID_FADE.1 - AID_FADE.0), 0.0, 1.0);
+    if fade <= 0.0 {
+        return 0.0;
+    }
+    let u_ref = max(u, wheel::V_MIN);
+    // Where the front patches are actually going, in the body frame.
+    let travel = atan((w + omega * LF) / u_ref);
+    let sliding = clamp((abs(slip_r) - SLIDE.0) / (SLIDE.1 - SLIDE.0), 0.0, 1.0);
+    let cmd = steer * lock;
+    let extra = if travel * omega < 0.0 { travel * abs(steer) * sliding } else { 0.0 };
+    let extra = if (cmd + extra) * cmd < 0.0 { -cmd } else { extra };
+    extra * fade + steer_damp(u, w, omega, ay, slip_r, lock)
+}
+
+/// The damping half of [`steer_aid`] on its own, for a driver who brings
+/// their own: the bot has yaw-rate feedback of its own and subtracts this so
+/// the two do not stack.
+pub fn steer_damp(u: f32, w: f32, omega: f32, ay: f32, slip_r: f32, lock: f32) -> f32 {
+    let fade = clamp((u - AID_FADE.0) / (AID_FADE.1 - AID_FADE.0), 0.0, 1.0);
+    if fade <= 0.0 {
+        return 0.0;
+    }
+    let u_ref = max(u, wheel::V_MIN);
+    let sliding = clamp((abs(slip_r) - SLIDE.0) / (SLIDE.1 - SLIDE.0), 0.0, 1.0);
+    let beta = atan(w / u_ref);
+    let sideways = clamp((abs(beta) - SIDEWAYS.0) / (SIDEWAYS.1 - SIDEWAYS.0), 0.0, 1.0);
+    let rate = omega - ay / u_ref;
+    let fast = clamp((abs(rate) - RATE.0) / (RATE.1 - RATE.0), 0.0, 1.0);
+    clamp(-YAW_DAMP * rate, -lock, lock) * max(max(sliding, sideways), fast) * fade
+}
+
 /// Split a nominal steering angle into left and right road-wheel angles.
 ///
 /// Both wheels are on the same steering rack but describe different circles, so
@@ -444,6 +566,29 @@ pub fn ackermann(delta: f32) -> (f32, f32) {
     )
 }
 
+/// Move a pedal towards where the driver wants it, at the rate a foot can.
+///
+/// The third input aid, and the smallest. A gamepad trigger already takes
+/// time to squeeze and this leaves it alone unless it is faster than a foot;
+/// a key goes from nothing to everything in one tick, and what that does to
+/// a rear-drive car mid-corner is not a question of the tires. Traction
+/// control can hold the wheels at their peak from the first substep, but the
+/// load transfer, the yaw and the driver's own next decision all happen on
+/// the pedal's timescale, and with no pedal there was no timescale. Pressing
+/// is moving away from rest in either direction; letting go is quicker, so a
+/// lift is still a lift.
+///
+/// It lives in the physics and not in the browser's key mapping for the same
+/// reasons the other two do: the bots' feet are in here as well, and an aid
+/// that lives only in the client is an aid the authority has to be trusted to
+/// agree with.
+#[inline]
+pub fn travel(pos: f32, target: f32, press: f32, release: f32, h: f32) -> f32 {
+    let pressing = abs(target) > abs(pos) && target * pos >= 0.0;
+    let rate = if pressing { press } else { release };
+    pos + clamp(target - pos, -rate * h, rate * h)
+}
+
 /// Body-frame position of each wheel centre, `+x` forward and `+y` left.
 #[inline]
 fn wheel_pos(i: usize) -> V2 {
@@ -460,6 +605,10 @@ fn wheel_pos(i: usize) -> V2 {
 pub fn integrate(car: &mut CarState, input: &CarInput, h: f32) {
     let inp = input.sanitize();
     let speed = car.speed();
+
+    // --- pedals -----------------------------------------------------------
+    car.pedal = travel(car.pedal, inp.throttle, THROTTLE_PRESS, THROTTLE_RELEASE, h);
+    car.brake_pedal = travel(car.brake_pedal, inp.brake, BRAKE_PRESS, BRAKE_RELEASE, h);
     // Everything below asks the wreckage what it is still allowed to do. On an
     // undamaged car every one of these multipliers is exactly 1, so the model
     // is the model and damage is a set of coefficients on it -- not a fork.
@@ -471,7 +620,9 @@ pub fn integrate(car: &mut CarState, input: &CarInput, h: f32) {
     // than to the output, so the driver has to hold against it exactly as long
     // as they want to go straight.
     let lock = steer_lock(speed) * dmg.steer_lock();
-    let target = clamp(inp.steer * lock + dmg.steer_pull(), -MAX_STEER, MAX_STEER);
+    let v_body = car.vel().to_local(car.heading);
+    let aid = steer_aid(v_body.x, v_body.y, car.omega, car.ay, car.slip_r, inp.steer, lock);
+    let target = clamp(inp.steer * lock + aid + dmg.steer_pull(), -MAX_STEER, MAX_STEER);
     let max_delta = STEER_RATE * h;
     car.steer += clamp(target - car.steer, -max_delta, max_delta);
     let (steer_l, steer_r) = ackermann(car.steer);
@@ -484,12 +635,17 @@ pub fn integrate(car: &mut CarState, input: &CarInput, h: f32) {
     let fz = [load.fl, load.fr, load.rl, load.rr];
 
     // --- where each contact patch is going --------------------------------
-    let v_body = car.vel().to_local(car.heading);
     let (u, w) = (v_body.x, v_body.y);
+
+    // Which way the gearbox is trying to move the car. The assists need it:
+    // a slip ratio that means wheelspin going forwards is signed the other
+    // way going backwards.
+    let dir = if car.gear < 0.0 { -1.0 } else { 1.0 };
 
     let mut wheels = car.wheels();
     let mut contact = [Contact::default(); 4];
     let mut kappa = [0.0f32; 4];
+    let mut spin = [0.0f32; 4];
     for i in 0..4 {
         let r = wheel_pos(i);
         // Contact point velocity: v + omega x r, then into the wheel's frame.
@@ -511,39 +667,29 @@ pub fn integrate(car: &mut CarState, input: &CarInput, h: f32) {
         // against the same floor the tires will use.
         let u_ref = max(abs(vc.x), wheel::V_MIN);
         kappa[i] = (wheels[i].omega * wheel::RADIUS - vc.x) / u_ref;
+        // Wheelspin, as traction control should see it: how far the tread is
+        // outrunning the road in the direction of drive. The road only counts
+        // where it is going that way. A car rolling forwards with stopped
+        // wheels while the driver holds reverse is not spinning its wheels,
+        // whatever the slip ratio says; it is waiting to be braked, and
+        // cutting the throttle for it stranded bots nose-in to barriers.
+        spin[i] = (wheels[i].omega * wheel::RADIUS * dir - max(vc.x * dir, 0.0)) / u_ref;
     }
 
-    // --- drivetrain --------------------------------------------------------
-    // Traction control watches the driven wheels' slip in whichever direction
-    // the gearbox is trying to move the car. The direction matters: reverse is
-    // a ratio of nearly fifteen to one, so it lights the rear tires up more
-    // readily than first does, and a slip ratio that means wheelspin going
-    // forwards is signed the other way going backwards. Left unsigned, a car
-    // backing out of a barrier sits on the rev limiter going nowhere.
-    let dir = if car.gear < 0.0 { -1.0 } else { 1.0 };
-    let pedal = inp.throttle * dir;
-    let spin = max(kappa[RL] * dir, kappa[RR] * dir);
-    let throttle = if pedal > 0.0 {
-        // Back to the wire's convention on the way out, where a negative
-        // throttle is the request for reverse rather than a negative torque.
-        wheel::traction_control(pedal, spin) * dir
-    } else {
-        inp.throttle
-    };
-    let mut dt = car.drivetrain();
-    // Damage reaches the engine as less air, which is what a radiator wearing
-    // its own condenser actually does to one -- so it scales the pedal rather
-    // than the torque curve, and idle stays idle.
-    let drive = dt.step(throttle * dmg.power(), wheels[RL].omega, wheels[RR].omega, u, h);
-    let torque = [0.0, 0.0, drive.torque_l, drive.torque_r];
-    let coupling = [0.0, 0.0, drive.coupling, drive.coupling];
+    // --- tires -------------------------------------------------------------
+    // Every patch is read before any wheel moves: the driven pair go through
+    // the drivetrain together, and the body needs all four.
+    let mut patch = [Patch::default(); 4];
+    for i in 0..4 {
+        patch[i] = wheels[i].patch(&contact[i], h);
+    }
 
     // --- brakes ------------------------------------------------------------
     // ABS on the pedal; the handbrake is a cable to the rear calipers and gets
     // no help at all, which is exactly why it is useful for putting the car
     // sideways. The pedal itself may not be the driver's -- see
     // [`reverse_assist`].
-    let pressure = reverse_assist(inp.throttle, inp.brake, u);
+    let pressure = reverse_assist(inp.throttle, car.brake_pedal, u);
     let hand = inp.handbrake * wheel::BRAKE_HAND;
     let brake = [
         wheel::anti_lock(pressure * wheel::BRAKE_F, kappa[FL]),
@@ -552,6 +698,38 @@ pub fn integrate(car: &mut CarState, input: &CarInput, h: f32) {
         wheel::anti_lock(pressure * wheel::BRAKE_R, kappa[RR]) + hand,
     ];
 
+    // --- drivetrain --------------------------------------------------------
+    // Traction control watches the driven wheels in whichever direction the
+    // gearbox is trying to move the car. Reverse is a ratio of nearly fifteen
+    // to one, so it lights the rear tires up more readily than first does.
+    // What it decides is a scale on the pedal, kept apart from the driver's
+    // intent: the gearbox reads the key for which way to go, and must not
+    // mistake a closed throttle for a released key.
+    let tc = if inp.throttle * dir > 0.0 {
+        wheel::traction_control(max(spin[RL], spin[RR]))
+    } else {
+        1.0
+    };
+    let mut dt = car.drivetrain();
+    // Damage reaches the engine as less air, which is what a radiator wearing
+    // its own condenser actually does to one -- so it scales the pedal rather
+    // than the torque curve, and idle stays idle.
+    // The engine and both rear wheels move together; the fronts on their own.
+    // `car.ax` is still last substep's, which is what both want: how fast the
+    // road under each patch is about to speed up.
+    let [fl, fr, rl, rr] = &mut wheels;
+    let drive = dt.step(
+        inp.throttle,
+        car.pedal * tc * dmg.power(),
+        Driven { wheel: rl, patch: &patch[RL], brake: brake[RL] },
+        Driven { wheel: rr, patch: &patch[RR], brake: brake[RR] },
+        u,
+        car.ax,
+        h,
+    );
+    fl.spin(&patch[FL], brake[FL], car.ax, h);
+    fr.spin(&patch[FR], brake[FR], car.ax, h);
+
     // --- tire forces, summed onto the body ---------------------------------
     let mut fx_body = 0.0;
     let mut fy_body = 0.0;
@@ -559,15 +737,15 @@ pub fn integrate(car: &mut CarState, input: &CarInput, h: f32) {
     let mut slip = [0.0f32; 4];
     let mut sat = [0.0f32; 4];
     for i in 0..4 {
-        let out = wheels[i].step(&contact[i], torque[i], brake[i], coupling[i], h);
+        let p = &patch[i];
         // Back out of the wheel's frame and onto the chassis.
-        let f = V2::new(out.fx, out.fy).to_world(steer[i]);
+        let f = V2::new(p.fx, p.fy).to_world(steer[i]);
         let r = wheel_pos(i);
         fx_body += f.x;
         fy_body += f.y;
-        mz += r.cross(f) + out.mz;
-        slip[i] = out.alpha;
-        sat[i] = out.saturation;
+        mz += r.cross(f) + p.mz;
+        slip[i] = p.alpha;
+        sat[i] = p.saturation;
     }
 
     // Drag opposes travel. Applied to the body rather than the patches because

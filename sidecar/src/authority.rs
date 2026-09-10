@@ -91,6 +91,8 @@ fn from_row(r: &CarState) -> PhysicsCar {
         dmg_rear: r.dmg_rear,
         dmg_left: r.dmg_left,
         dmg_right: r.dmg_right,
+        pedal: r.pedal,
+        brake_pedal: r.brake_pedal,
         active: 1.0,
         ..Default::default()
     }
@@ -501,6 +503,8 @@ impl Authority {
                 dmg_rear: c.dmg_rear,
                 dmg_left: c.dmg_left,
                 dmg_right: c.dmg_right,
+                pedal: c.pedal,
+                brake_pedal: c.brake_pedal,
             });
         }
         // An empty grid still publishes, because this call is also the lease's

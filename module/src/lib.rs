@@ -270,6 +270,12 @@ pub struct CarState {
     pub dmg_rear: f32,
     pub dmg_left: f32,
     pub dmg_right: f32,
+
+    /// Where the pedals actually are. A foot takes a quarter of a second to
+    /// floor a throttle and the physics models that, so the pedal position is
+    /// state a replay has to start from, not something the input implies.
+    pub pedal: f32,
+    pub brake_pedal: f32,
 }
 
 /// Best laps. Aggregating these is bookkeeping, not simulation, so it belongs

@@ -543,7 +543,7 @@ kbd {
       <div class="v-cyan"><dt>cost per tick</dt><dd>71 <small>µs</small></dd></div>
       <div><dt>tick budget used</dt><dd>0.4 <small>%</small></dd></div>
       <div class="v-green"><dt>prediction error</dt><dd>0.000 <small>m</small></dd></div>
-      <div><dt>browser core</dt><dd>56 <small>KB wasm</small></dd></div>
+      <div><dt>browser core</dt><dd>58 <small>KB wasm</small></dd></div>
     </dl>
     <p class="readout-note">Measured on the sidecar's own status line: 7 cars, 6 of them AI drivers. Cost per tick is the whole tick, SDK included. The zero holds across a ~90 ms round trip to Railway too.</p>
   </header>
@@ -682,7 +682,7 @@ kbd {
           <h2>The module becomes a mailbox with a schema.</h2>
           <p>
             Strip the simulation out and what is left is small enough to describe in three words.
-            The module in this demo is 451 lines of Rust and contains no integrator, no collision
+            The module in this demo is 457 lines of Rust and contains no integrator, no collision
             code and not even a track. It is:
           </p>
           <ul class="notes">
@@ -728,7 +728,7 @@ kbd {
 
               <!-- browser contents -->
               <text class="svg-t" x="44" y="92" fill="#38e8ff">physics.wasm</text>
-              <text class="svg-s" x="44" y="110">cdylib · 56 KB · 0 imports</text>
+              <text class="svg-s" x="44" y="110">cdylib · 58 KB · 0 imports</text>
               <line x1="44" y1="128" x2="236" y2="128" stroke="rgba(120,170,220,0.16)" stroke-width="1"/>
               <text class="svg-s" x="44" y="152" fill="#dbe6f5">predict every tick</text>
               <text class="svg-s" x="44" y="172" fill="#dbe6f5">rewind + replay on error</text>
@@ -788,7 +788,7 @@ kbd {
       <section id="trust">
         <div class="kicker"><span>The trust gate</span><span class="lane lane-db">module</span></div>
         <div class="prose">
-          <h2>Eight lines are the whole security model.</h2>
+          <h2>The fence is eight lines. The trust model around it is 112.</h2>
           <p>
             The sidecar is not privileged by the runtime. It authenticates like any other client and
             gets an ordinary <code>Identity</code>, the module owner's, which is the only one
@@ -799,36 +799,8 @@ kbd {
         </div>
 
         <div class="code">
-          <header><span>module/src/lib.rs</span><em>the entire trust boundary</em></header>
-<pre><span class="c">/// Claim the right to publish authoritative state. Two questions, and they are
-/// different ones. *May* you be the authority: only the identity that published
-/// the module. *Can* you have it right now: only if the seat is empty, already
-/// yours, or its holder has gone quiet for a lease.</span>
-<span class="k">#[reducer]</span>
-<span class="k">pub fn</span> <span class="fn-db">claim_authority</span>(ctx: &amp;ReducerContext, physics_fingerprint: u32) -&gt; Result&lt;(), String&gt; {
-    <span class="k">let mut</span> cfg = config(ctx);
-    <span class="k">let</span> me = ctx.connection_id().ok_or(<span class="st">"needs a live connection"</span>)?;
-
-    <span class="c">// `None` only on a database older than this column, where the first claim pins it.</span>
-    <span class="k">if</span> cfg.owner.is_some_and(|owner| owner != ctx.sender()) {
-        <span class="k">return</span> Err(<span class="st">"not the database owner"</span>.into());
-    }
-    <span class="k">if let</span> Some(held) = cfg.holder {
-        <span class="k">let</span> quiet = ctx.timestamp.to_micros_since_unix_epoch()
-            - cfg.updated_at.to_micros_since_unix_epoch();
-        <span class="k">if</span> held != me &amp;&amp; quiet &lt; LEASE_MICROS {
-            <span class="k">return</span> Err(<span class="st">"another sidecar holds the lease"</span>.into());
-        }
-    }
-    cfg.sidecar = Some(ctx.sender());
-    cfg.holder = Some(me);
-    cfg.physics_fingerprint = physics_fingerprint;
-    cfg.updated_at = ctx.timestamp;
-    ctx.db.config().id().update(cfg);
-    Ok(())
-}
-
-<span class="c">/// The fence. Holding the right identity is not enough, because a sidecar that
+          <header><span>module/src/lib.rs</span><em>the fence, and the claim that sets it</em></header>
+<pre><span class="c">/// The fence. Holding the right identity is not enough, because a sidecar that
 /// was replaced while it was away still has it, so what is checked is the
 /// connection recorded by the winning claim.</span>
 <span class="k">fn</span> <span class="fn-db">require_authority</span>(ctx: &amp;ReducerContext) -&gt; Result&lt;Config, String&gt; {
@@ -836,8 +808,50 @@ kbd {
     <span class="k">if</span> cfg.holder.is_some() &amp;&amp; cfg.holder == ctx.connection_id() {
         Ok(cfg)
     } <span class="k">else</span> {
-        Err(<span class="st">"only the sidecar holding the lease may write simulation state"</span>.into())
+        Err(<span class="st">"only the sidecar holding the authority lease may write simulation state"</span>.into())
     }
+}
+
+<span class="c">/// Claim the right to publish authoritative state. Two questions, and they are
+/// different ones. *May* you be the authority: only the identity that published
+/// the module. *Can* you have it right now: only if the seat is empty, already
+/// yours, or its holder has gone quiet for a lease.</span>
+<span class="k">#[reducer]</span>
+<span class="k">pub fn</span> <span class="fn-db">claim_authority</span>(ctx: &amp;ReducerContext, physics_fingerprint: u32) -&gt; Result&lt;(), String&gt; {
+    <span class="k">let mut</span> cfg = config(ctx);
+    <span class="k">let</span> me = ctx
+        .connection_id()
+        .ok_or(<span class="st">"authority must be claimed over a live connection"</span>)?;
+
+    <span class="k">match</span> cfg.owner {
+        Some(owner) <span class="k">if</span> owner != ctx.sender() =&gt; <span class="k">return</span> Err(<span class="st">"not the database owner"</span>.into()),
+        Some(_) =&gt; {}
+        <span class="c">// A database that predates the column has nobody pinned; the first claim pins it.</span>
+        None =&gt; {
+            log::warn!(<span class="st">"no owner recorded; pinning authority to {}"</span>, ctx.sender());
+            cfg.owner = Some(ctx.sender());
+        }
+    }
+
+    <span class="k">if let</span> Some(held) = cfg.holder {
+        <span class="k">let</span> quiet = ctx.timestamp.to_micros_since_unix_epoch()
+            - cfg.updated_at.to_micros_since_unix_epoch();
+        <span class="k">if</span> held != me &amp;&amp; quiet &lt; LEASE_MICROS {
+            <span class="k">return</span> Err(<span class="st">"another sidecar holds the lease"</span>.into());
+        }
+        <span class="k">if</span> held != me {
+            log::warn!(<span class="st">"lease expired after {quiet} us; taking authority from {held}"</span>);
+        }
+    }
+
+    cfg.sidecar = Some(ctx.sender());
+    cfg.holder = Some(me);
+    cfg.sidecar_online = <span class="k">true</span>;
+    cfg.physics_fingerprint = physics_fingerprint;
+    cfg.updated_at = ctx.timestamp;
+    ctx.db.config().id().update(cfg);
+    log::info!(<span class="st">"authority claimed by {} on {me}"</span>, ctx.sender());
+    Ok(())
 }</pre>
         </div>
 
@@ -932,7 +946,7 @@ kbd {
 
         <figure>
           <div class="scroller">
-            <svg viewBox="0 0 1000 262" role="img" aria-label="The sidecar simulates every tick at 60 Hz and publishes a snapshot on every third tick, giving 20 Hz on the wire. Each tick runs six stages: check authority, sync cars, pull inputs, drive bots, world step, and conditionally publish.">
+            <svg viewBox="0 0 1000 262" role="img" aria-label="The sidecar simulates every tick at 60 Hz and publishes a snapshot on every third tick, giving 20 Hz on the wire. Each tick runs five stages, sync cars, check authority, pull inputs, drive bots, world step, and then conditionally publishes.">
               <defs>
                 <marker id="m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
                   <path d="M0 0 L10 5 L0 10 z" fill="#6b7f99"/>
@@ -967,9 +981,9 @@ kbd {
 
               <g>
                 <rect class="svg-box" x="42" y="126" width="136" height="44" rx="6"/>
-                <text class="svg-s" x="110" y="153" text-anchor="middle" fill="#dbe6f5">check_authority</text>
+                <text class="svg-s" x="110" y="153" text-anchor="middle" fill="#dbe6f5">sync_cars</text>
                 <rect class="svg-box" x="198" y="126" width="136" height="44" rx="6"/>
-                <text class="svg-s" x="266" y="153" text-anchor="middle" fill="#dbe6f5">sync_cars</text>
+                <text class="svg-s" x="266" y="153" text-anchor="middle" fill="#dbe6f5">check_authority</text>
                 <rect class="svg-box" x="354" y="126" width="136" height="44" rx="6"/>
                 <text class="svg-s" x="422" y="153" text-anchor="middle" fill="#dbe6f5">pull_inputs</text>
                 <rect class="svg-box" x="510" y="126" width="136" height="44" rx="6"/>
@@ -993,7 +1007,7 @@ kbd {
             </svg>
           </div>
           <figcaption>
-            <b>Six stages, then a conditional publish.</b> Ahead of them, off the left of the diagram,
+            <b>Five stages, then a conditional publish.</b> Ahead of them, off the left of the diagram,
             each tick pumps the SDK connection, which is where a good half of those 71 µs go. The loop sleeps
             almost to the tick boundary and spins the rest, because no mainstream scheduler wakes a
             thread accurately enough for 60 Hz. How much to leave for the spin is measured, not
@@ -1085,7 +1099,7 @@ kbd {
           </p>
           <ol class="steps">
             <li><b>Predict</b> Every tick, sample the controls and step the whole grid in wasm immediately: the local car on what the driver is doing, every rival on the controls the authority published with its last snapshot. Store <code>(tick, input, resulting state)</code> for the local car in a 256-entry ring buffer. Steering has zero input lag regardless of ping.</li>
-            <li><b>Reconcile</b> A snapshot arrives carrying the authority's state for some tick <code>T</code> in the recent past, for every car at once. Each rival is overwritten with its own, then the world is rewound to <code>T</code> and replayed forward to now, the local car on its stored inputs and the rivals on their held ones. Typically 5 to 20 ticks, and a full grid is about 1.7 ms of it per snapshot on a desktop.</li>
+            <li><b>Reconcile</b> A snapshot arrives carrying the authority's state for some tick <code>T</code> in the recent past, for every car at once. Each rival is overwritten with its own, then the world is rewound to <code>T</code> and replayed forward to now, the local car on its stored inputs and the rivals on their held ones. Typically 5 to 20 ticks, and a full grid is about 1.8 ms of it per snapshot on a desktop.</li>
             <li><b>Smooth</b> A rewind moves the cars, which would read as a stutter. Instead keep the difference between where each car <em>appeared</em> to be and where it now <em>is</em> as a visual offset, and decay that to zero over ~220 ms. The simulation is corrected instantly; the picture catches up.</li>
           </ol>
         </div>
@@ -1202,8 +1216,8 @@ kbd {
             guess about a car doing nothing and a poor one about a car doing something, which is a
             problem, because a car doing something is the only kind you ever hit. Over eight bots at two
             hundred milliseconds of lead, scored against rivals that were braking or cornering, an
-            extrapolated pose is <b>0.35 m</b> out at the 99th percentile and <b>2.14 m</b> at its worst;
-            the same car carried forward through the physics is <b>0.06 m</b> and <b>0.13 m</b>. The tail
+            extrapolated pose is <b>0.28 m</b> out at the 99th percentile and <b>2.52 m</b> at its worst;
+            the same car carried forward through the physics is <b>0.06 m</b> and <b>0.15 m</b>. The tail
             is the column that matters, because the mean is dominated by cars going in a straight line,
             where every scheme agrees and none of this makes any difference.
           </p>
@@ -1237,8 +1251,8 @@ kbd {
           <p>
             What that costs is the grid instead of one car, on the forward step and on every replayed
             tick of a rollback. On a desktop, twelve ticks of lead and twenty rollbacks a second: one car
-            is 1.9 ms of work per second of racing, eight cars 13.7 ms, a full twenty-four 44 ms, which
-            is 4.4 % of the frames it happens in. A mid-range phone runs wasm three to eight times slower
+            is 1.6 ms of work per second of racing, eight cars 13.2 ms, a full twenty-four 46 ms, which
+            is 4.6 % of the frames it happens in. A mid-range phone runs wasm three to eight times slower
             against the same 16.7 ms frame.
           </p>
         </div>
@@ -1282,7 +1296,7 @@ kbd {
           <div class="card-title">Verify it, don't assume it</div>
           <p>
             <code>node scripts/verify-determinism.mjs</code> runs the same 1200-tick scripted race through
-            both builds and diffs the raw <code>f32</code> bits at ten checkpoints. A determinism claim you
+            both builds and diffs the raw <code>f32</code> bits at eleven checkpoints. A determinism claim you
             do not test is a determinism claim that will quietly stop being true.
           </p>
         </div>
@@ -1343,14 +1357,13 @@ kbd {
         <div class="prose">
           <h3>Getting state across the boundary for free</h3>
           <p>
-            <code>CarState</code> is <code>#[repr(C)]</code> and entirely <code>f32</code>, 44 of them,
+            <code>CarState</code> is <code>#[repr(C)]</code> and entirely <code>f32</code>, 46 of them,
             so the browser maps it with a single <code>Float32Array</code> over wasm linear memory and reads
             and writes the simulation in place, with no serialization on the hot path. Most of those
-            forty-four are not pose but vehicle state: four wheel speeds, four tires part way through
-            building up their cornering force, the body&rsquo;s roll and pitch, the drivetrain, and how far
-            each face of the body has been crushed. Every one of them has to survive the round trip, because a rollback that replays from position and velocity alone is replaying a different
-            car. The whole core is a
-            56 KB <code>.wasm</code> with zero imports: no wasm-bindgen, no wasm-pack, no build plugin.
+            forty-six are not pose but the simulation's internal state, and every one of them has to
+            survive the round trip, because a rollback that replays from position and velocity alone is
+            replaying a different car. The whole core is a
+            58 KB <code>.wasm</code> with zero imports: no wasm-bindgen, no wasm-pack, no build plugin.
             All allocation happens inside <code>phys_init</code>, so nothing later grows memory and detaches
             the views.
           </p>
@@ -1371,20 +1384,17 @@ kbd {
             <li>re-claim authority, since the previous holder is now disconnected;</li>
             <li>resume the tick counter at <code>config.server_tick + 1</code>, because starting from zero has the module silently reject every snapshot as out of order;</li>
             <li>adopt every car from its last published <code>car_state</code> row, and not just its
-                pose: how fast each of its four wheels is turning, how much cornering force each tire has
-                built up, how far the body has rolled and pitched, what gear it is in and what the engine
-                is doing, and how far each face of the body has been crushed. That is why the row carries
-                the whole forty-four-field record rather than a dozen of them: a car resumed from position
-                and velocity alone is a different car, and a client replaying against it diverges within a
-                few ticks;</li>
+                pose. That is why the row carries the whole record rather than a dozen fields of it: a car
+                resumed from position and velocity alone is a different car, and a client replaying
+                against it diverges within a few ticks;</li>
             <li>resume every driver on the controls they were last holding, which the same row carries, so
                 the grid does not lift off for a tick while the first inputs of the new session arrive;</li>
             <li>reconcile the bot field back to its configured count, keeping whoever is already out there.</li>
           </ul>
           <p>
-            Drivers keep their momentum through a restart. What is missing is a <em>hot</em> standby: there is
-            a visible gap while the process comes up, and nothing arbitrates between two sidecars racing to
-            claim after a network partition.
+            Drivers keep their momentum through a restart. What is missing is a <em>hot</em> standby: this
+            deployment runs one sidecar, so there is a visible gap while the process comes up. Two sidecars
+            against one database already arbitrate through the lease in <code>claim_authority</code>.
           </p>
           <p>
             The general lesson for your own sidecar: <strong>publish enough state to resume from</strong>.
@@ -1409,7 +1419,7 @@ kbd {
       <section id="size">
         <div class="kicker"><span>The size of it</span><span class="lane lane-sidecar">server</span></div>
         <div class="prose">
-          <h2>The whole server side is 1060 lines.</h2>
+          <h2>The whole server side is 1066 lines.</h2>
           <p>
             The other cost worth quoting is how much of this you have to write. The schema,
             the identity check, the tick loop and the publish come to three hand-written
@@ -1424,26 +1434,26 @@ kbd {
               <tr><th scope="col">File</th><th scope="col">Code</th><th scope="col">What is in it</th></tr>
             </thead>
             <tbody>
-              <tr><th scope="row">module/src/lib.rs</th><td class="num">455</td><td>tables, the inbox, the registry, the outbox, the two authority checks</td></tr>
-              <tr><th scope="row">sidecar/src/authority.rs</th><td class="num">416</td><td>one tick: sync the grid, schedule inputs, simulate and publish, or stand by</td></tr>
+              <tr><th scope="row">module/src/lib.rs</th><td class="num">457</td><td>tables, the inbox, the registry, the outbox, the two authority checks</td></tr>
+              <tr><th scope="row">sidecar/src/authority.rs</th><td class="num">420</td><td>one tick: sync the grid, schedule inputs, simulate and publish, or stand by</td></tr>
               <tr><th scope="row">sidecar/src/main.rs</th><td class="num">189</td><td>connect, subscribe, and hold 60 Hz</td></tr>
-              <tr class="sum srv"><th scope="row">server side</th><td class="num">1060</td><td>the module plus both sidecar files above</td></tr>
-              <tr><th scope="row">web/src/sim.ts</th><td class="num">450</td><td>predict the grid, rewind, replay, smooth</td></tr>
-              <tr><th scope="row">web/src/net.ts</th><td class="num">528</td><td>subscriptions, clock estimate, the spectator view, reconnection</td></tr>
+              <tr class="sum srv"><th scope="row">server side</th><td class="num">1066</td><td>the module plus both sidecar files above</td></tr>
+              <tr><th scope="row">web/src/sim.ts</th><td class="num">448</td><td>predict the grid, rewind, replay, smooth</td></tr>
+              <tr><th scope="row">web/src/net.ts</th><td class="num">525</td><td>subscriptions, clock estimate, the spectator view, reconnection</td></tr>
               <tr><th scope="row">web/src/main.ts</th><td class="num">12</td><td>the clock steering that holds the lead</td></tr>
-              <tr class="sum cli"><th scope="row">browser netcode</th><td class="num">990</td><td>the three web files above</td></tr>
+              <tr class="sum cli"><th scope="row">browser netcode</th><td class="num">985</td><td>the three web files above</td></tr>
             </tbody>
           </table>
         </div>
 
         <div class="prose">
           <p>
-            For scale, <code>physics/src</code> is <strong>3767</strong> lines across fifteen
-            files, three and a half times the server side. The simulation is by far the biggest
+            For scale, <code>physics/src</code> is <strong>4276</strong> lines across fifteen
+            files, four times the server side. The simulation is by far the biggest
             piece of the project, and the part you would write wherever you ran it, which is
             rather the point.
             <code>spacetime generate</code> emits another
-            <strong>3234</strong> across 42 files that nobody reads.
+            <strong>3264</strong> across 42 files that nobody reads.
           </p>
         </div>
 
@@ -1497,8 +1507,8 @@ kbd {
               <tr><th scope="row">database</th><td class="num">20 write tx / s</td><td>the whole grid in one call whatever its size, plus 30/s per connected player</td></tr>
               <tr><th scope="row">transactions</th><td class="num">20 / s</td><td>one <code>push_states</code> per 3 ticks, all cars in one call</td></tr>
               <tr><th scope="row">client uplink</th><td class="num">30 / s</td><td>one <code>set_input</code> row, overwritten</td></tr>
-              <tr><th scope="row">browser core</th><td class="num">56 KB</td><td>wasm with zero imports; 10 000 replayed ticks in 70 ms in Node</td></tr>
-              <tr><th scope="row">rollback</th><td class="num">~140 µs</td><td>20 replayed ticks, affordable on every snapshot</td></tr>
+              <tr><th scope="row">browser core</th><td class="num">58 KB</td><td>wasm with zero imports; one car stepped in 5.8 µs in Node</td></tr>
+              <tr><th scope="row">rollback</th><td class="num">62 µs</td><td>12 replayed ticks of one car, affordable on every snapshot</td></tr>
               <tr><th scope="row">prediction error</th><td class="num">0.000 m</td><td>local link, and across a ~90 ms round trip to <code>us-east4</code></td></tr>
             </tbody>
           </table>
@@ -1551,22 +1561,6 @@ kbd {
             cars are nearly free because however many there are they arrive in one transaction, and
             players are not, because each writes thirty times a second.
           </p>
-        </div>
-      </section>
-
-      <!-- ============================================================ 11 -->
-      <section id="gaps">
-        <div class="kicker"><span>Honest gaps</span><span class="lane">proof of concept</span></div>
-        <div class="prose">
-          <h2>What this does not solve.</h2>
-          <ul class="notes">
-            <li><strong>A standby has to be running to be one.</strong> A second sidecar stands by for 20 µs a tick against the authority's 62, and when the authority is killed outright the authoritative stream goes quiet for 103 to 123 ms against the 50 ms that separates two snapshots anyway, because the database settles who holds the lease. But this deployment ships one container with one sidecar in it, so a restart is still a gap of however long a process takes to come up. Two containers against one database is the fix, and nothing is in the way of it.</li>
-            <li><strong>Contact is still resolved on the authority's timeline.</strong> Every car in the browser lives on one clock and is simulated onto it, so what you see, what you lean on and what the authority computes are the same arrangement of cars. A rival braking or cornering is followed rather than guessed at, on the same tires, and so is one hit by somebody else, because whoever does the hitting is in the same world on the same tick. What is left is the one thing no amount of simulation reaches: a driver who changes their mind inside the round trip, because the client is holding an input that was true when it was published and is not true now. Rewinding every rival into the view the toucher had is a much larger piece of work, and one most racing games decline, because two cars cannot both be right about a mutual impulse.</li>
-            <li><strong>Predicting the grid costs the grid.</strong> The forward step and every replayed tick of a rollback scale with the number of cars on the grid. On a desktop a full twenty-four-car field is 4.4 % of the frames it happens in; a mid-range phone runs wasm three to eight times slower. A realistic field is a fraction of that, and the measurement has not been repeated on a phone.</li>
-            <li><strong>The rate limiter still runs the reducer.</strong> A flood is dropped before it writes a row or fans one out, which is the part that costs everyone else. The transaction is still opened; bounding that is the host's job, not the module's.</li>
-            <li><strong>The tick boundary spins.</strong> Measuring what the scheduler actually needs rather than guessing keeps it to 1.5 % of a core instead of 7.2 %, but a spin is a spin. Zero needs a timer the operating system does not portably offer.</li>
-            <li><strong>One track, 24 slots, one database.</strong> The grid size is a constant shared by the module and the physics crate, and the sidecar refuses to start if the two disagree. Sharding across databases is not attempted.</li>
-          </ul>
         </div>
       </section>
 

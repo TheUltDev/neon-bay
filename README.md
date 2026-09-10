@@ -25,11 +25,28 @@ both sides run identical instructions on identical inputs.
 **[Play it](https://neon-bay.ult.workers.dev).** The client is on Cloudflare's
 edge, the database and authority on Railway in `us-east4`. The zero holds across
 that ~90 ms round trip too, because distance does not matter, only running the
-same instructions. See [Deploying it](#deploying-it).
+same instructions.
 
 **[How it works](https://neon-bay.ult.workers.dev/tech).** The architecture
 written up as a page, for anyone who wants to build a sidecar of their own
 rather than clone this one.
+
+**[The car](PHYSICS.md).** What the simulation itself models: tires,
+drivetrain, load transfer, contact and damage, the driver aids, and the numbers
+the tests pin.
+
+**[The netcode](NETCODE.md).** How the browser predicts, reconciles and
+smooths, how it simulates the other cars rather than guessing at them, and what
+each of those costs.
+
+**[Running and deploying it](DEVOPS.md).** Setup, the dev loop, the container,
+the edge deploy, failover, and the commands for testing and poking at it.
+
+**[What could be better](IMPROVEMENTS.md).** The gaps in this proof of concept,
+as work that could be done.
+
+The rest of this file is the sidecar pattern: the shape, what it costs, what
+it trusts, why the two builds agree, and how it scales.
 
 ---
 
@@ -53,13 +70,11 @@ below is designed to move a number on it.
   sidecar never sees any of it, because a client can only say "throttle down", so
   by the time a round trip is out the authority disagrees by two or three metres
   and pulls the car back. Nothing teleports.
-- **Hit somebody.** Contact is nearly plastic, the way a car-to-car impact
-  really is: at 70 km/h of closing speed one percent of it comes back and the
-  rest goes into the shape of both cars. The dent stays for the rest of the lap,
-  and it is on the wire, so every browser in the race sees the same wreck. It
-  costs you downforce, steering lock, engine power and grip on the corner that
-  took it, and the *BODY* readout on the dash says how much of the car is left.
-  Cross the line and you get a fresh one.
+- **Hit somebody.** The dent stays for the rest of the lap, and it is on the
+  wire, so every browser in the race sees the same wreck. It costs you
+  downforce, steering lock, engine power and grip until you cross the line, and
+  the *BODY* readout on the dash says how much of the car is left. The contact
+  and crush models are in [PHYSICS.md](PHYSICS.md).
 - **Follow somebody into a corner and watch "rival guess out by".** That is the
   other half of the panel and a different kind of number from the one above it.
   Prediction error is the client re-running its own car and having to agree with
@@ -99,12 +114,12 @@ reimplementation. One source of truth for what a car does.
 
 | Path        | What it is |
 |-------------|------------|
-| `physics/`  | The simulation. Deterministic `f32`, no dependencies. Pacejka tires (`tire.rs`), wheel and slip dynamics (`wheel.rs`), engine and gearbox (`drivetrain.rs`), load transfer (`suspension.rs`), aero (`aero.rs`), box contacts (`collide.rs`), crush and damage (`damage.rs`), the track, the bot driver, and a bare C-ABI wasm bridge. |
+| `physics/`  | The simulation. Deterministic `f32`, no dependencies: a four-wheel vehicle model, its drivetrain, load transfer and aero, box contacts with a crush model, the track, the bot driver, and a bare C-ABI wasm bridge. [PHYSICS.md](PHYSICS.md) describes it. |
 | `module/`   | The SpacetimeDB module. Tables and reducers only: an inbox for inputs, a registry of who is racing, an outbox for authoritative state. |
 | `sidecar/`  | The authority. A SpacetimeDB client that steps the world at 60 Hz, drives the bots, and publishes snapshots at 20 Hz. `src/bin/load.rs` is a second binary: synthetic players, for measuring what a client costs the database. |
 | `web/`      | The game. Vite + TypeScript, no framework, drawn on WebGPU, WebGL 2 or Canvas2D depending on the browser. Prediction, rollback, prediction of the other cars too, and a telemetry HUD that shows all of it working. Sound is synthesized, so there are no audio files to ship. `public/tech.html` is the architecture write-up served at `/tech`. |
 | `scripts/`  | Setup, dev launcher, the native-vs-wasm determinism check, and the container entrypoint. |
-| `Dockerfile` | The database and the sidecar in one image, for [deploying](#deploying-it). `railway.json` and `web/wrangler.toml` are the rest of it. |
+| `Dockerfile` | The database and the sidecar in one image, for [deploying](DEVOPS.md#deploying-it). `railway.json` and `web/wrangler.toml` are the rest of it. |
 
 ## What it costs
 
@@ -117,44 +132,29 @@ Measured on the status line it prints once a second:
 
 Seventy-one microseconds of a 16 667 µs budget, four tenths of one percent. That
 is the whole tick: pumping the connection, reading the inbox, driving the bots,
-stepping the world, and publishing every third tick. **The simulation is 27 µs
+stepping the world, and publishing every third tick. **The simulation is 31 µs
 of it and the bot AI another 2.** Most of the rest is the SDK.
 
-Those 27 µs are the price of the vehicle model above, and it is not a small
-one. A lumped car, one bicycle with a friction circle per axle stepped twice a
-tick, does the same seven in **5.6 µs** on this machine. Four Magic Formula
-evaluations per wheel-substep, at eight substeps, with the contacts solved on the
-same clock as the tires, is about **five times** the arithmetic:
+Those 31 µs are the price of a four-wheel vehicle model with Magic Formula
+tires and contacts solved on the same 480 Hz clock, and it is not a small one:
 
 | cars | physics | bot AI | total | of a 60 Hz budget |
 |---|---|---|---|---|
-| 1  |  3.7 µs | 0.4 µs |  4.1 µs | 0.02% |
-| 7  | 27.4 µs | 2.4 µs | 29.8 µs | 0.18% |
-| 16 | 63.1 µs | 5.6 µs | 68.7 µs | 0.41% |
-| 24 | 99.9 µs | 8.8 µs |108.7 µs | 0.65% |
+| 1  |   4.2 µs | 0.4 µs |   4.6 µs | 0.03% |
+| 7  |  30.5 µs | 2.5 µs |  33.1 µs | 0.20% |
+| 16 |  72.4 µs | 6.1 µs |  78.5 µs | 0.47% |
+| 24 | 111.5 µs | 9.0 µs | 120.6 µs | 0.72% |
 
-Which is the argument, not a caveat. Five times the arithmetic is exactly the
-kind of work you do not want inside a transaction, and moving it out costs the
-module nothing at all: it has no opinion about tire models, because it does not
-depend on the physics crate. `cargo run -p physics --example probe --release`
-reproduces the table.
-
-The wasm build replays 10 000 single-car ticks in 70 ms in Node, so a 20-tick
-rollback costs about **140 µs**: a replayed tick resolves contact eight times as
-well as stepping the car, and it is still cheap enough that the client can afford
-one on every snapshot without thinking about it.
-
-The whole physics core is a **56 KB** `.wasm` with zero imports: no
-wasm-bindgen, no wasm-pack, no build plugin. `CarState` is `#[repr(C)]` and all
-`f32`, forty-four of them, so the browser maps it with one `Float32Array` over
-wasm memory and reads and writes the simulation in place. Nothing is serialized
-on the hot path.
+Which is the argument, not a caveat. That is exactly the kind of work you do not
+want inside a transaction, and moving it out costs the module nothing at all: it
+has no opinion about tire models, because it does not depend on the physics
+crate. `cargo run -p physics --example probe --release` reproduces the table.
 
 **The database's cost does not grow with the simulation's complexity.** A car
 five times harder to simulate changes nothing about what the database does:
 24 cars and 1 car are the same 20 write transactions a second,
 because every car rides in one `push_states` call. What it does change is the
-size of that call: the row is the 44-float record plus a handful of scalars,
+size of that call: the row is the 46-float record plus a handful of scalars,
 about 190 bytes, and it costs tenths of a percent of a core, 0.2 % for a six-car
 grid against 0.09 % idle and 0.6 % for twenty-four.
 
@@ -194,160 +194,6 @@ The trust boundary did not disappear, it *moved*: from "the database is the only
 thing that can be trusted" to "the database plus the identity that published the
 module". That is the trade. In exchange the simulation becomes a normal process,
 one you can profile, shard, or restart without touching the data.
-
-## How the netcode works
-
-Three pieces, in the order they run.
-
-**1. Predict.** Every tick, the client samples the controls and steps the whole
-grid in wasm immediately: its own car on what the driver is doing, every rival on
-the controls the authority published with that car's last snapshot, held. It
-stores `(tick, input, resulting state)` for its own car in a 256-entry ring
-buffer. Steering has zero input lag regardless of ping.
-
-**2. Reconcile.** Snapshots arrive at 20 Hz carrying the authority's state for a
-tick `T` in the recent past, for every car at once. Each rival is overwritten
-with its own, since there is nothing in a car this client does not own to
-reconcile, only news to adopt. Then the world is rewound to `T` and replayed
-forward to now, the local car on its stored inputs and the rivals on their held
-ones. Typically 5 to 20 ticks, and the grid's worth of work rather than one
-car's: a full field costs about 1.7 ms of it per snapshot on a desktop.
-
-The local car's half of that is a *replay* and the rivals' half is a
-*prediction*, and the difference is worth keeping straight. The replay lands on
-identical bits, which is what `physics::tests::rollback_replay_is_bit_exact`
-pins: re-simulating from an older state with the same inputs reproduces the same
-bits. The prediction does not and never will, because the client does not know
-what the other driver did next. The HUD shows both, on separate lines, for
-exactly that reason.
-
-**3. Smooth.** A rewind moves the cars, which would read as a stutter. So the
-client keeps the gap between where each car appeared to be and where it now is
-as a visual offset, and decays it to zero over ~220 ms. The simulation is
-corrected at once; the picture catches up. Corrections over 9 m on the local car,
-meaning a respawn or a long stall, snap instead and raise the "resyncs" counter;
-a rival that jumps more than 4 m has respawned or changed hands and is likewise
-shown moving rather than slid across the track.
-
-**The clock.** For prediction to be exact, an input stamped for tick `T` has to
-be applied by the authority *at* tick `T`. The client estimates where the
-sidecar's clock is, adds a round trip plus two ticks of margin, and steers its
-own tick rate by up to ±6 % to hold that lead. You cannot feel it. The sidecar
-schedules inputs rather than applying them on arrival: an early one waits for its
-tick, and a late one is applied at once, since there is no rewinding the
-authority. The client absorbs the difference on its next rollback.
-
-**Other cars.** The client simulates them too. The local car is
-deliberately in the future, far enough ahead that its input reaches the authority
-before the tick it belongs to, so holding rivals a few ticks in the *past*, which
-is what an interpolation buffer does, puts them wrong by the sum of the two. At
-racing speed that is several metres, systematically, in the direction of travel:
-you would be leaning on a car the authority had somewhere else. Every car on the
-grid therefore lives on one clock, and it is the tick the local car is
-predicting.
-
-Each rival is seeded from its newest snapshot and stepped forward on the
-controls the authority published beside it, held until the next one arrives.
-`car_state` carries those four channels for exactly this: they are the one thing
-about another driver that a client cannot work out for itself.
-
-The cheap alternative is to extrapolate the pose, carrying the car along its
-velocity and rotating it as it goes so a car mid-corner follows the arc instead
-of flying off the tangent. That is a good guess about a car doing nothing and a
-poor one about a car doing something, which is a problem, because a car doing
-something is the only kind you ever hit. An extrapolated pose knows nothing about
-tires saturating, about load taking ninety milliseconds to move, or about drag,
-and nothing at all about the pedals. Over eight bots at two hundred milliseconds
-of lead, scored against rivals that were braking or cornering when the snapshot
-was taken:
-
-| scheme | mean | p99 | worst |
-|---|---|---|---|
-| constant turn rate | 0.111 m | 0.350 m | 2.14 m |
-| held input | 0.008 m | 0.059 m | 0.13 m |
-| zero input (control) | 0.088 m | 0.146 m | 0.24 m |
-
-The tail is the column that matters. The mean is dominated by cars going in a
-straight line, where every scheme agrees and none of this makes any difference.
-The third row separates the two halves of the claim: real dynamics does most of
-the work, and the real pedals halve what is left, which is what earns the input
-its place on the wire.
-
-Bots are a hard test for held input and an easy one for the extrapolation. A
-pure-pursuit controller re-decides its steering sixty times a second, and a human
-holding a key does not. `cargo run -p physics --example predict --release`.
-
-The mask `World::step` takes says which cars are being *integrated*, and both
-processes pass the whole grid. It is not a statement about ownership. The client
-integrates cars it does not own, and should, because the authority is integrating
-those same cars from the same state with the same code. A clear bit is for a car
-there is nothing to integrate *from*: one no snapshot has arrived for yet, which
-is solid but has no state worth advancing.
-
-**A rival is reconciled by being overwritten**, not by being blended. The client
-has no stake in a car it does not own and the snapshot is not an opinion, so when
-one lands it goes straight into the slot and the held input goes with it. The
-error it reveals is an apology for a guess that has just been corrected: feeding
-that back into the next contact would re-introduce exactly what it was hiding. So
-it goes into the *picture*, as a fading offset, which is the same trick the local
-car plays after a rollback, and nowhere near the physics.
-
-**A rival is not a rival that weighs nothing** either, and that is easy to
-confuse with not being allowed to move it. Saying the first to a solver by giving
-the car infinite mass says the second as well, and an infinite mass returns the
-whole impulse: the local car rebounds off something it should have shoved aside.
-So the solve uses both cars' real mass. With both of them in the mask the
-positional repair is split between them exactly as the authority splits it, which
-is the point of being in the same arrangement as the authority. A car outside the
-mask keeps its mass and takes none of that push, and what the hit did to it is
-remembered for one tick, so a single contact cannot fire on all eight substeps
-against something that never reacts.
-
-Handed the same tick's state the authority has, a client that steps its rival
-runs the authority's own arithmetic on the authority's own numbers and lands on
-the same bits. One that parks it as scenery does not:
-
-| closing | authority | parked client | stepped client |
-|---|---|---|---|
-|  6 m/s | 22.49 m/s | 1.97 m/s, 0.74 m out | exact |
-| 12 m/s | 25.86 m/s | 3.91 m/s, 1.22 m out | exact |
-| 20 m/s | 30.48 m/s | 5.00 m/s, 1.41 m out | exact |
-| 30 m/s | 34.94 m/s | 6.81 m/s, 1.92 m out | exact |
-
-`cargo run -p physics --example crash --release` reproduces it. That is the
-contact model with the connection taken out of it. What a *stale* snapshot costs
-on top is the netcode's question, and
-`physics::tests::a_client_predicts_the_hit_the_authority_resolves` is where it
-gets asked: a rival braking, cornering, or braking at the last moment, nine ticks
-of lead, and the worst the client is ever out by about its own car.
-
-| the rival is | parked ghost | stepped rival |
-|---|---|---|
-| travelling | 1.48 m, 9.81 m/s | 0.00 m |
-| braking hard | 1.68 m, 8.48 m/s | 0.00 m |
-| leaning on the wheel | 1.42 m, 11.21 m/s | 0.00 m |
-| braking mid-corner | 1.67 m, 9.94 m/s | 0.00 m |
-| braking late | 1.47 m, 9.75 m/s | 0.05 m, 0.37 m/s |
-
-The zeros are not rounded. When a driver holds an input, which is what a driver
-mostly does, the client reproduces the authority to the bit and there is nothing
-left to be out by. The last row is where the scheme costs something and always
-will: a car that changes its mind inside the round trip cannot be followed, only
-corrected.
-
-**What it costs** is the grid instead of one car, on the forward step and on
-every replayed tick of a rollback. Twelve ticks of lead, twenty rollbacks a
-second, `node scripts/bench-client.mjs`:
-
-| cars | forward step | rollback | per second of racing | of a frame |
-|---|---|---|---|---|
-| 1 | 6.7 us | 72.7 us | 1.86 ms | 0.2 % |
-| 8 | 46.9 us | 544 us | 13.7 ms | 1.4 % |
-| 24 | 157 us | 1728 us | 44.0 ms | 4.4 % |
-
-That is a desktop, and a desktop is not the machine to worry about: a mid-range
-phone runs wasm three to eight times slower against the same 16.7 ms frame. A
-full grid is the number to watch, and a full grid is rare.
 
 ## Determinism
 
@@ -401,524 +247,6 @@ The sidecar hands its number to `claim_authority`, the module publishes it in
 wasm computes. On a mismatch the authority readout goes red and reads **physics
 mismatch**, and the console names both numbers and says to redeploy the two
 together.
-
-## The car
-
-Not a dot with a velocity, and not a lumped approximation of one either. Four
-wheels, each with its own angular velocity, each pressed into the road by a
-load that four separate things are arguing over.
-
-The tire is a **Pacejka Magic Formula**, evaluated per wheel, per substep, for
-combined slip. Three properties of real rubber come out of it that a linear
-cornering-stiffness model cannot produce at all, and every one of them is
-something a driver feels:
-
-- **Grip peaks and then falls.** Past about eight degrees of slip, asking for
-  more gives you less. That is the difference between a slide and a larger
-  cornering force.
-- **Sliding grip is below peak grip**: 71% of it longitudinally, 85%
-  laterally. This is the entire reason ABS is worth having, and the reason
-  locking the fronts means you go straight.
-- **Grip is sub-linear in load.** Doubling the weight on a tire does not double
-  what it can do, so *how* the load is spread across four patches decides the
-  car's balance and not just its total grip.
-
-Everything else exists to feed that. Load transfer runs through roll and pitch
-as real second-order systems, so weight takes about 90 ms to move and the
-front-to-rear split is set by the **roll stiffness distribution**. Stiffen the
-front bar and the car understeers, for the reason a real one does. Each wheel
-has rotational inertia, so **slip ratio is a real quantity**: wheelspin is the
-rear wheels genuinely outrunning the road, lock-up is a wheel at zero rad/s
-while the car keeps moving, and the handbrake needs no special case at all.
-Behind it is an **engine torque curve** through a slipping clutch, a six-speed
-box that cuts torque to shift, and a **limited-slip differential** that sends
-torque away from the wheel that is spinning up. ABS and traction control are
-modelled because the car has them, not to paper over anything.
-
-None of the behaviour above is a case in a list. Understeer, power oversteer,
-lift-off oversteer, engine braking and the way all of them change with speed are
-consequences of those parts, and the tests measure them rather than assert them
-(`cargo test -p physics --release`):
-
-| | |
-|---|---|
-| 0-100 km/h | 4.1 s, traction-limited off the line |
-| 0-200 km/h | 12.6 s |
-| top speed | 277 km/h, where power meets drag rather than where the gearing runs out |
-| 50 m/s to a standstill | 82 m, 1.48 g average, ABS holding the wheels short of lock |
-| peak lateral | 1.28 g at 20 m/s, 1.43 g at 60 m/s; the difference is downforce |
-| at the limit | front slip 9.5°, rear 5.3°: understeer-limited, on purpose |
-| body movement | 2.97° of roll and 1.81° of pitch per g, 94 ms to get there |
-| engine | 425 N·m, 275 kW at 7200 rpm, six speeds and a reverse |
-| circuit | 1424.7 m, 15-20 m wide, 12 checkpoints |
-| bot lap times | 48.5 to 52.0 s, spread by driver skill and by how much of the car is left |
-
-The skidpad test *sweeps* the steering to find the limit rather than reading one
-fixed input, because with a real tire curve more lock past the peak buys less
-lateral force: a fixed input measures understeer, not grip. It pins the
-understeer balance too, because an oversteer-limited car is undriveable with a
-keyboard.
-
-`cargo run -p physics --example probe --release` prints the whole envelope:
-standing start, peak lateral g against speed, and what a tick costs.
-
-### Two aids, and only two
-
-Both are there because a keyboard is not a car, and both are named as aids in
-the source so nobody mistakes them for physics.
-
-`steer_lock` tapers the available lock with speed. A real rack has a fixed
-ratio, but a real driver also has a wheel with 900 degrees of travel and two
-hands on it; a key is down or up.
-
-`reverse_assist` brakes for you when you ask for a direction the car is not
-going in. A gearbox will not select reverse above a crawl, correctly, since the
-ratio is short enough that engaging it at speed would put the engine past the
-limiter backwards. A negative pedal is a request for a *direction* and not a
-negative torque. Between those two facts sits a car that will not do what it is
-told: hold the reverse key while still rolling forward and nothing happens at
-all, the car coasting on rolling resistance until it happens to be slow enough,
-with nothing about that to suggest that what is wanted is the brake. So the car
-brakes itself until it is not going anywhere, and the gearbox does the rest.
-
-It lives in the physics rather than in the browser's key mapping for two reasons.
-The bots need it, because a bot nose-first into a barrier asks for exactly this.
-And an aid that lives only in the client is an aid the authority has to be
-trusted to agree with.
-
-Everything else that looks like an aid, ABS and traction control, is modelled
-because the car has it.
-
-## Crashing it
-
-A car is not a billiard ball. Steel that folds does not give the energy back, so
-a real car-to-car impact is *mostly plastic*, and the harder it is the more
-plastic it gets. One coefficient of restitution for every speed gets that exactly
-backwards where it matters, by making a 100 km/h shunt bounce like a 5 km/h
-one.
-
-What actually happens to steel is in `physics/src/damage.rs`, and it is the
-model accident reconstruction uses. Campbell's observation is that residual
-crush is **linear in impact speed**, `v = B0 + B1·C`, where `B0` is the speed a
-car shrugs off entirely (2 m/s, near enough the 5 mph bumper standard) and `B1`
-is the crush per metre per second past it. Integrating the force that implies
-gives the energy a given depth of crush has absorbed; inverting it gives the
-depth a given amount of absorbed energy produces. Damage accumulates through
-the *energy* rather than by adding depths, so the structure stiffens as it folds
-and two 30 kJ hits leave the dent that one 60 kJ hit does.
-
-Restitution then falls out of the same sentence instead of being a second,
-independent knob. If everything up to `B0` is elastic and everything past it
-goes into bending metal, the fraction of the energy returned is `(B0/v)²`, so
-**e = B0/v**. That is derived rather than fitted, and it lands within a few
-hundredths of the published curves: 0.20 at 10 m/s against Antonetti's 0.24,
-0.10 at 20 m/s against 0.10.
-
-Two cars, one rear-ending the other, both coasting:
-
-| closing | separation | of the closing speed | at a fixed e = 0.35 | absorbed | nose |
-|---|---|---|---|---|---|
-|  6 m/s | 0.29 m/s | 5 % |  8 % |  10 kJ | 0.05 m |
-| 12 m/s | 0.19 m/s | 2 % | 20 % |  37 kJ | 0.15 m |
-| 20 m/s | 0.17 m/s | 1 % | 24 % | 111 kJ | 0.29 m |
-| 30 m/s | 0.04 m/s | 0 % | 27 % | 256 kJ | 0.45 m, which is all of it |
-
-The fourth column is what a fixed coefficient gives for the same four hits, and
-it is the whole problem in one column: it gets *bouncier* the harder the impact.
-At 108 km/h of closing speed it throws the two cars apart at 8 m/s.
-
-Bodies meet as **oriented boxes**: a separating-axis test, the incident face
-clipped against the reference one for a two-point manifold, and a
-sequential-impulse solver with accumulated clamping. Two points is what a flat
-contact needs: one can only push, two can push *and* resist a twist, which is
-the difference between scraping along a barrier and pirouetting off it.
-
-Those contacts are solved **every substep**, on the same 480 Hz clock as the
-tires. Resolving them once at the end of a tick instead leaves two cars closing
-at 30 m/s half a metre inside each other before anything is done about it, and
-half a metre in, the shallowest separating axis is not reliably the one you drove
-in along. Solved with the tires, the deepest overlap a hit reaches is 5 mm at
-30 m/s of closing speed and 13 mm at 45. The one thing still sampled at 60 Hz is
-*where the barrier is*: that is a search through the centreline, it is the most
-expensive thing a tick does, and a barrier does not move, so the search runs once
-and the contact it feeds runs eight times.
-
-**Damage is simulation state, not decoration.** Four numbers on the wire, the
-residual crush in metres on each face of the body, and every one of them changes
-what the car can do:
-
-- a folded nose has no splitter left, so it makes a fraction of the front
-  downforce and a good deal of drag it did not have before;
-- the rack loses lock, and bent geometry pulls towards the side that took the
-  hit, so the car has to be held straight;
-- the radiator is wearing its own condenser, so the engine gets less air;
-- a bent corner rubs its own bodywork, so that tire has less grip.
-
-It is on the wire because rollback needs it, since a client replaying without it
-is replaying a car that is not the one being corrected, and because it is also,
-directly, the shape the renderer draws. Sixteen points instead of eight, so a
-dent can pucker an edge in the middle rather than shrink the whole car, and all
-three backends get it from the same function.
-
-**Completing a lap repairs the car.** The start/finish straight is where a pit
-lane would be and this circuit has not got one, so crossing the line is the stop
-you never had to make. Without it damage is a one-way ratchet: *Respawn* clears
-it on demand, but a bot has no thumbs, and a driver who has not found the button
-spends the rest of the race in whatever they made of the first corner. A lap is
-the right clock for it. Fifty seconds is long enough that a shunt is something
-you have to drive around and short enough that nobody is stuck with one, and five
-fields of eight bots racing for two and a half minutes finish at a mean severity
-of 0.00 to 0.03.
-
-A scrape is not a crash, and the model has to know the difference or a car is
-written off by a long graze down a barrier. The solver measures the two
-separately: the energy a contact destroys *head-on*, which is normal impulse
-doing work and is zero for a contact that is merely holding station, and the
-energy it destroys *sliding*. The first folds panels. The second wears them, at
-a fraction of the rate and under a ceiling of 10 cm, because sliding contact
-takes your flank off and not your width.
-
-`cargo run -p physics --example crash --release` prints all of it.
-
-## Drawing it
-
-Three renderers, one picture. The client asks for **WebGPU**, falls back to
-**WebGL 2**, then to **Canvas2D**. The Renderer panel says which one you got and
-on what hardware, and its three buttons change tier in place: no reload, the
-camera does not move, and a tier this browser will not give you is disabled and
-says why on hover. `?renderer=` pins a tier from the URL.
-
-The two GPU tiers are one renderer, not two. `web/src/render/gpu.ts` builds a
-frame's worth of triangles and hands them to a device interface that WebGL 2 and
-WebGPU implement in 269 and 333 lines respectively. The track is triangulated once at load
-into two buffers that never change; everything that moves is appended to three
-more every frame. A full grid comes to eight draw calls, where the 2D renderer
-issues one per car per detail.
-
-Nothing is sorted and there is no depth buffer. Triangles land in the order they
-were written, which is the order the 2D renderer paints in, and that is why the
-three agree down to the stacked strokes that make the barriers glow. The one
-place the APIs differ, which end of a render target counts as the top, comes to
-a single sign in a projection.
-
-Text is the exception on both GPU tiers. Nameplates go on a 2D canvas over the
-top, because a glyph atlas for a dozen short strings is more machinery than the
-strings are worth.
-
-## Running it
-
-Needs [SpacetimeDB](https://spacetimedb.com/install) 2.8, Rust with the
-`wasm32-unknown-unknown` target, and Node 20+. Everything below works the same
-on Linux, macOS and Windows.
-
-```bash
-spacetime start                    # in its own terminal
-
-./scripts/setup.sh --fresh         # publish, generate bindings, build wasm, npm install
-./scripts/dev.sh --bots 6          # sidecar + web client
-```
-
-On Windows, the same two scripts in PowerShell:
-
-```powershell
-powershell -File scripts/setup.ps1 -Fresh
-powershell -File scripts/dev.ps1 -Bots 6
-```
-
-Then open <http://localhost:5173>, pick a name and color, and drive with
-`WASD`. `Space` is the handbrake, `R` respawns, `G` toggles the server ghost,
-`C` toggles the rotating camera, which starts on.
-
-**Version pinning matters.** `spacetime generate` emits bindings for the CLI's
-own version, and they have to compile against the SDK this project pins. Those
-pins live in three files and move together:
-
-| | |
-|---|---|
-| `module/Cargo.toml` | `spacetimedb = "2.8"` |
-| `sidecar/Cargo.toml` | `spacetimedb-sdk = "2.8"` |
-| `web/package.json` | `"spacetimedb": "~2.8.3"` |
-
-Both setup scripts compare your CLI against those pins and warn if they have
-drifted. Generated bindings are not committed, so run `setup` before `cargo
-build` at the workspace root. `cargo test -p physics` needs nothing generated
-and works on a fresh clone.
-
-<details>
-<summary>Running the pieces by hand</summary>
-
-```bash
-spacetime publish --server local --module-path module --delete-data=always --yes physics-sidecar
-spacetime generate --lang rust --include-private -y --out-dir sidecar/src/module_bindings --module-path module
-spacetime generate --lang typescript -y             --out-dir web/src/module_bindings     --module-path module
-
-node scripts/build-wasm.mjs                     # cargo build + copy into web/public
-export STDB_TOKEN="$(spacetime login show --token | awk '/auth token/ { print $NF }')"
-cargo run -p sidecar --release -- --bots 6      # terminal 1
-cd web && npm install && npm run dev            # terminal 2
-```
-
-Two of those need saying out loud. `--include-private` is what puts the `input`
-table in the sidecar's bindings, because a private table is invisible to an
-ordinary client and the codegen leaves it out; the browser's bindings are
-generated without the flag, so the web bundle does not even carry the accessor.
-And `STDB_TOKEN` is the module publisher's token, which is the only identity
-allowed to read that table or to claim the authority. Without it the sidecar
-exits on its first subscription and says which flag it wanted.
-
-While iterating on the physics, `cd web && npm run wasm` rebuilds and copies the
-wasm on its own; Vite picks it up on reload.
-</details>
-
-<details>
-<summary>Pointing the pieces at a different machine</summary>
-
-The client defaults to `<page host>:3000`. Override it per tab:
-
-```
-http://localhost:5173/?uri=http://192.168.1.20:3000&db=physics-sidecar
-```
-
-The sidecar takes `--uri` and `--db` (or `STDB_URI` / `STDB_DB` / `STDB_TOKEN`),
-and both dev scripts forward them. Vite binds to localhost only; to reach it
-from another device on the network use `npm run dev -- --host`.
-</details>
-
-## Deploying it
-
-Two hosts, because the two halves want different things. The database and the
-sidecar go to **Railway as one container**, so the link between them stays on
-loopback rather than becoming a network: they talk on the hot path, every input
-as it lands and twenty snapshots a second. The browser client is static, so it
-goes to **Cloudflare Workers** at the edge. Its only conversation is one `wss://`
-back to Railway.
-
-### The game server
-
-`Dockerfile` builds all three native pieces in one pass: module wasm, generated
-bindings, sidecar. `scripts/railway-start.sh` supervises the pair inside the
-container, starting SpacetimeDB, waiting for `/v1/ping`, publishing the module
-into it, starting the authority, and bringing the whole container down if either
-half exits. Railway restarts it and the sidecar re-claims, resuming the tick
-clock from `config.server_tick`.
-
-```bash
-railway login
-railway init                # or `railway link` for an existing project
-railway up                  # builds the Dockerfile and deploys
-railway domain              # the public https:// URL
-```
-
-`railway.json` health-checks `/v1/ping`, restarts always, and pins the service
-to `us-east4` at **one replica**. One replica is not a limitation waiting to be
-fixed: `push_states` is guarded by a single registered identity, so the module
-would turn a second sidecar away even if Railway ran one.
-
-**Storage persists.** A Railway volume at `/stdb` holds three things: the
-database in `data/`, the keypair identities are signed with in `keys/`, and the
-CLI's own identity in `cli.toml`. They are kept apart because the database is
-the only one it is ever right to throw away.
-
-Four things have to be true for that to mean anything, and all four live in
-`scripts/railway-start.sh`:
-
-- **The module is published in place**, not recreated. `spacetime publish`
-  without `--delete-data` updates the module and keeps the tables underneath it,
-  and creates the database when the volume is empty, so first boot is not a
-  special case. A module the running database cannot migrate to is retried once,
-  then recreated from scratch, losing the data loudly: a demo that will not start
-  is worse than a demo that lost its lap times.
-- **The signing keypair lives on the volume**, at `/stdb/keys`, via
-  `--jwt-priv-key-path` and `--jwt-pub-key-path`. SpacetimeDB otherwise keeps it
-  beside the CLI config, which is in the image rather than on the volume. A
-  keypair that changes every deploy hands every returning player a token signed
-  by a key that is gone: their records survive, their claim on them does not.
-- **The CLI's identity lives on the volume too**, at `/stdb/cli.toml`, via
-  `--config-path`. This is the one that bites, because nothing goes wrong until
-  the *second* deploy. A database belongs to the identity that created it, and
-  the CLI keeps its identity under `$HOME`, which is in the image. Leave it there
-  and deploy two arrives a stranger to the database deploy one created:
-  publishing answers `403 ... is not authorized`, and the recreate fallback
-  cannot save it either, because resetting a database is also something only its
-  owner may do. The container crashloops with no way to grant itself the rights
-  back, and the only fix is from outside: delete `data/`, and nothing else.
-- **The sidecar connects as that identity too**, because `input` is private and
-  only the database's owner can read it. The entrypoint lifts
-  `spacetimedb_token` out of the same `cli.toml` and hands it over in the
-  environment rather than on the command line. Without it the sidecar's
-  subscription is refused and it exits saying which token it wanted, which is
-  the right failure: loud, immediate, and impossible to mistake for a bug in the
-  physics.
-
-The volume needs `RAILWAY_RUN_UID=0` alongside it: the image runs as a non-root
-user and Railway mounts volumes root-owned. Set the variable before attaching
-the volume and the deploy in between still comes up.
-
-A connecting client has no way to know a key was rotated, so it treats a refused
-token as a credential to discard rather than a server to give up on. See
-[The client](#the-client).
-
-Service variables:
-
-| | |
-|---|---|
-| `PORT` | Set to `3000`. What the server listens on and what Railway's proxy forwards to; they have to agree. |
-| `SIDECAR_BOTS` | AI drivers on the grid. Default 6, capped at 24, which is the whole grid and leaves no room for players. |
-| `SIDECAR_QUIET` | Set to anything to silence the once-a-second status line. |
-| `STDB_DB` | Database name. Default `physics-sidecar`. |
-
-A public instance accepts public connections, which is why the authority is not
-first-come: `claim_authority` refuses everyone but the identity that published
-the module, recorded in `config` by `init`. The restart window after a deploy is
-not an opening for a stranger, only for the next sidecar holding that token.
-
-### The client
-
-The deployed client is not on the same host as the server, so it has to be told
-where the server is. That lives in `web/.env.production`, which is committed
-rather than ignored: it is a public address, and keeping it in the repo is what
-makes the deployed client reproducible from a clone.
-
-```bash
-cd web
-npm run deploy      # type check, Vite build, wrangler deploy
-```
-
-`wrangler.toml` declares an assets-only Worker, no script, just `dist/`, and
-`npm run deploy` type checks and builds before uploading so a broken build never
-ships. Two pages come out: the game at `/` and the write-up at `/tech`. Anything
-that is not a real file falls through to the game, so a deep link does not 404.
-
-`?uri=` overrides that at runtime, which is the quickest way to point a deployed
-page at a server on your desk:
-
-```
-https://<your-worker>.workers.dev/?uri=http://192.168.1.20:3000
-```
-
-**A refused token is forgotten, not retried.** The client keeps its identity
-token in `localStorage` and presents it on every dial, and the browser SDK trades
-it for a short-lived one *before* opening the socket. So a token the database
-will not verify fails the dial outright and looks like a server that is down,
-when the truth is the opposite: the server is up and would take the same player
-without it. `Net.open` tells the two apart, drops the token and redials as a
-stranger. The retry cannot loop, because the second pass has no token to reject.
-
-This matters even with the volume attached, because a key rotates whenever the
-volume is replaced or the database moves. Without it the reconnect loop
-re-presents the dead token forever.
-
-**Ship the sidecar and `physics.wasm` together.** They are two halves of one
-simulation deployed to different places, so it is easy to update one and not the
-other. If you do, the authority readout turns red and reads *physics mismatch*
-instead of leaving you to work out why prediction went bad. See
-[Checking it at runtime too](#checking-it-at-runtime-too).
-
-## Failover
-
-Run a second sidecar against the same database and it does not fight the first
-one. It stands by: connected, subscribed, its world adopting every snapshot as
-it lands, publishing nothing. Costed on the status line, standing by is 20 µs a
-tick against the authority's 62, and it says `STANDBY` at the end of the line so
-you can tell which process is which. Adopting a row is the same work whatever is
-in it, and a standby runs no physics at all, so what it costs does not move with
-the simulation.
-
-The database decides who holds the seat, because it is the only thing that sees
-both processes:
-
-- **`claim_authority` grants** when nobody holds the lease, when you already do,
-  or when the holder has not published for two seconds. Otherwise it refuses.
-  Two sidecars claiming at once are two transactions, and one of them commits
-  first; the loser reads `config` and keeps standing by.
-- **`push_states` checks the connection**, not the identity. That is the fence.
-  A sidecar that was partitioned long enough to lose its lease finds its writes
-  refused the instant it reconnects, sees it is no longer the holder, and demotes
-  itself, rather than publishing a race that moved on without it.
-- **Losing the socket frees the seat immediately.** `client_disconnected` clears
-  the holder, so the ordinary case of a deploy, a crash or a `kill` does not wait
-  out the lease at all.
-
-Killed outright with `kill -9`, and watching `car_state` from a third
-connection: the longest the authoritative stream went quiet across four runs was
-**103 to 123 ms**, against the 50 ms that separates two snapshots anyway. So the
-race pauses for about one extra snapshot, and resumes from the same tick the
-dead sidecar left, `config.server_tick + 1`, with every car adopted from its
-last published pose. Drivers keep their momentum, their lap and their position
-through a handover they mostly cannot see, and with it the gear they were in,
-the revs they were pulling, the speed each wheel was turning at and how far the
-body had rolled. All of it is on the wire for exactly this reason, the controls
-each driver had their hands on included, so the new authority resumes with the
-throttle where the old one left it instead of releasing every pedal on the grid
-for a tick.
-
-## Known limitations
-
-This is a proof of concept. Honest gaps:
-
-- **A standby has to be running to be one.** The arbitration above is real, but
-  this deployment ships a single container with a single sidecar in it, so a
-  restart is still a gap of however long the process takes to come up. Two
-  containers against one database is the fix, and nothing in the module or the
-  sidecar is in the way of it.
-- **Contact is still resolved on the authority's timeline.** Every car in the
-  browser lives on one clock and is simulated onto it, so what you see, what you
-  lean on and what the authority computes are the same arrangement of cars. A
-  rival braking or cornering is followed rather than guessed at, on the same
-  tires, which are in the client's wasm module too. So is a rival hit by somebody
-  else, because whoever does the hitting is in the same world on the same tick.
-  What is left is the one thing no amount of simulation reaches: a driver who
-  changes their mind inside the round trip, because the client is holding an
-  input that was true when it was published and is not true now. Real lag
-  compensation, where the authority rewinds every rival into the view the toucher
-  had, is not attempted, and most racing games decline it too, because two cars
-  cannot both be right about a mutual impulse.
-- **A rival's controls are on the wire, a tick late.** `car_state` carries the
-  four channels the authority was applying as it computed each pose, which is
-  what a client holds while it guesses. It is not a leak of the private `input`
-  table. That one is private because reading a rival's throttle a few
-  milliseconds *before* it takes effect is reading their mind; this is the same
-  reading a few milliseconds after, attached to the pose it already produced. But
-  it is more than the pose, and a client that wanted to build a telemetry overlay
-  of everyone's pedals can.
-- **The rate limiter still runs the reducer.** A flood is dropped before it
-  writes a row or fans one out, which is the part that costs everyone else, but
-  the transaction is still opened. Bounding *that* is the host's job, not the
-  module's.
-- **The tick boundary spins.** The sidecar measures how late its own sleeps
-  land and spins only that much, 1.5 % of a core on the machine these numbers
-  come from against 7.2 % for a fixed margin wide enough to cover it. A spin is
-  still a spin, and getting to zero needs a timer the operating system does not
-  portably offer.
-- **One track, 24 slots, one database.** The grid size is a constant shared by
-  the module and the physics crate, and the sidecar refuses to start if the two
-  disagree. Sharding across databases is not attempted.
-
-## Poking at it
-
-```bash
-cargo test -p physics --release -- --nocapture   # physics + netcode invariants
-cargo run -p physics --example probe   --release  # performance and handling envelope
-cargo run -p physics --example crash   --release  # what a hit costs, and predicts as
-cargo run -p physics --example wear    --release  # how battered a field of bots gets
-cargo run -p physics --example predict --release  # four ways to guess a rival, scored
-node scripts/verify-determinism.mjs              # native vs wasm, bit for bit
-node scripts/bench-client.mjs                    # what a browser tick costs, by grid size
-node scripts/build-wasm.mjs                      # rebuild just the browser core
-spacetime sql --server local physics-sidecar "SELECT car_id, tick, x, y, dmg_front FROM car_state"
-spacetime logs --server local physics-sidecar
-
-# Failover: start a second sidecar beside the one dev.sh runs. It prints
-# STANDBY once a second until you kill the first, then takes the race over
-# from the tick it left. Both need the module publisher's token.
-export STDB_TOKEN="$(spacetime login show --token | awk '/auth token/ { print $NF }')"
-cargo run -p sidecar --release -- --bots 6
-```
-
-In the browser console, `__neon` exposes `{ sim, net, renderer, hud, controls,
-audio }`. Try `__neon.sim.stats`, `__neon.net.rttMs`, `__neon.sim.cheat(30)`, or
-`__neon.sim.fingerprint` against `__neon.net.physicsFingerprint` to see the two
-physics builds agree.
 
 ## The numbers
 
@@ -992,69 +320,6 @@ is the right way round: a fifth of the CPU for a tick that occasionally lands a
 tenth of a millisecond late, which nothing downstream can tell from one that did
 not. The tick a snapshot carries is a number, not a timestamp.
 
-### Predicting the other cars
-
-Every remote car is carried forward from its newest snapshot to the tick the
-client is simulating. There are four ways to do that, and the example scores all
-four against where the car really went, over eight bots racing. Two of them are
-extrapolations of the pose. The other two run the physics: one on the controls
-the authority published with the snapshot, one with the pedals released. That
-last is the control, and it says how much of the accuracy is the pedals and how
-much is merely having real dynamics.
-
-Position error at the 99th percentile, which is the number this is judged on:
-
-| lead | straight line | constant turn rate | held input | zero input |
-|---|---|---|---|---|
-| 3 ticks (50 ms) | 0.017 m | 0.015 m | **0.002 m** | 0.007 m |
-| 6 ticks (100 ms) | 0.065 m | 0.058 m | **0.011 m** | 0.031 m |
-| 12 ticks (200 ms) | 0.259 m | 0.219 m | **0.061 m** | 0.137 m |
-| 18 ticks (300 ms) | 0.579 m | 0.471 m | **0.165 m** | 0.325 m |
-
-Rotating the velocity as the car is carried forward buys about half over a
-straight line, and it buys it mid-corner, which is where it matters. Running the
-physics buys another factor of three or four on top, and the pedals are half of
-that: dynamics without them still has the car braking when it is not, and
-coasting when it is. All four are far better than not predicting at all, which is
-not an error of centimetres but of whole car lengths, and a systematic one,
-always behind.
-
-The *average* rival is easy for every scheme: real tires, real wheel inertia and
-load that takes 90 ms to move cannot change direction abruptly, so even a
-straight line through the last snapshot stays true for a surprisingly long time.
-The *worst* rival is where they separate, and the worst rival is almost always
-one that has just been hit by somebody else. Scoring only those, meaning a car
-that takes a hit from another car *during* the lead, so the impulse is not in the
-snapshot being carried forward, at 200 ms, over the thousand of them in this
-race:
-
-| scheme | mean | p99 | worst |
-|---|---|---|---|
-| straight line | 0.188 m | 0.640 m | 1.57 m |
-| constant turn rate | 0.135 m | 0.791 m | 2.14 m |
-| held input | 0.013 m | 0.076 m | 0.12 m |
-| zero input | 0.077 m | 0.170 m | 0.24 m |
-
-An extrapolation cannot follow a collision that has not happened yet, and its
-whole tail is made of them. A grid stepped together can, and not by guessing the
-impulse better: the car doing the hitting is in the same world running the same
-physics on the same tick, so the client is not guessing at all. It arrives at the
-collision from both sides, the way the authority does.
-
-What is left in the tail after that is the thing no amount of simulation
-reaches: a driver who changes their mind inside the round trip. The client is
-holding an input that was true when it was published and is not true now, and
-nothing carried forward from before the change can know about it.
-
-Bots make this table pessimistic for held input and flattering to the two
-extrapolations: a pure-pursuit controller re-decides its steering sixty times a
-second, and a driver holding a key does not. Whatever margin the third column
-wins here, it wins by more against a person.
-
-```bash
-cargo run -p physics --example predict --release
-```
-
 ### Lines of code
 
 The other cost is how much of this you have to write. `scc` over the
@@ -1062,26 +327,26 @@ hand-written files, generated bindings excluded:
 
 | | Code | |
 |---|---|---|
-| `module/src/lib.rs` | 455 | tables, the inbox, the registry, the outbox, the two authority checks |
-| `sidecar/src/authority.rs` | 416 | one tick: sync the grid, schedule inputs, simulate and publish, or stand by |
+| `module/src/lib.rs` | 457 | tables, the inbox, the registry, the outbox, the two authority checks |
+| `sidecar/src/authority.rs` | 420 | one tick: sync the grid, schedule inputs, simulate and publish, or stand by |
 | `sidecar/src/main.rs` | 189 | connect, subscribe, and hold 60 Hz |
-| **server side** | **1060** | the module plus both sidecar files above |
-| `web/src/sim.ts` | 450 | predict the grid, rewind, replay, smooth |
-| `web/src/net.ts` | 528 | subscriptions, clock estimate, the spectator view, reconnection |
+| **server side** | **1066** | the module plus both sidecar files above |
+| `web/src/sim.ts` | 448 | predict the grid, rewind, replay, smooth |
+| `web/src/net.ts` | 525 | subscriptions, clock estimate, the spectator view, reconnection |
 | `web/src/main.ts` | 12 | the clock steering that holds the lead |
-| **browser netcode** | **990** | the three web files above |
+| **browser netcode** | **985** | the three web files above |
 
 ```bash
 scc module/src/lib.rs sidecar/src/main.rs sidecar/src/authority.rs
 scc web/src/sim.ts web/src/net.ts
 ```
 
-For scale, `physics/src` is **3942** lines across fifteen files, nearly four
-times the server side. The simulation is by far the biggest piece of the project,
+For scale, `physics/src` is **4276** lines across fifteen files, four times
+the server side. The simulation is by far the biggest piece of the project,
 and the part you would write wherever you ran it, which is the argument for being
 able to run it wherever you like. It is also the argument for running the *same*
 one on both sides: the browser predicts every rival through it, not around it.
-`spacetime generate` emits another **3254** across 42 files nobody reads.
+`spacetime generate` emits another **3264** across 42 files nobody reads.
 
 ## License
 

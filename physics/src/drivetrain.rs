@@ -22,8 +22,32 @@
 //! Gear selection is automatic because the client sends a throttle axis and not
 //! a shifter. The shift itself takes [`SHIFT_TIME`] with the clutch out, so an
 //! upshift mid-corner really does unload the rear for a moment.
+//!
+//! # One step for three bodies
+//!
+//! The clutch is a stiff damper between the engine and the axle, and the
+//! differential another between the two wheels. At 90 N.m per rad/s against
+//! 0.22 kg.m^2 the engine's mode alone would need ~2.4 kHz to step explicitly,
+//! so every coupling is taken implicitly. The first version did that one body
+//! at a time: the engine damped by the clutch's slope with the wheels held
+//! still, each wheel by the same slope with the engine held still. That is
+//! stable, and it is wrong. Under steady acceleration the engine and the wheels
+//! speed up *together* and the clutch torque does not change at all, but each
+//! body was still being charged for the change it would have seen had the other
+//! stood still. Through first gear that phantom came to a fifth of a g: the
+//! launch was slower at 480 Hz than at 2 kHz, the tires never reached their
+//! peak, and traction control never had a reason to fire on a straight.
+//!
+//! [`Drivetrain::step`] now solves the engine and both driven wheels as one
+//! 3x3 linear system per substep. The couplings are linear in the three speeds
+//! (until a clutch or a diff reaches what it can hold, at which point it is a
+//! constant and drops out of the Jacobian), so this is exact for them, and it
+//! costs two divides. The tire's own slope stays on the diagonal, with the
+//! road's expected acceleration folded in for the same reason -- see
+//! [`crate::wheel::Wheel::spin`].
 
 use crate::math::{abs, clamp, max, signum};
+use crate::wheel::{self, Patch, Wheel};
 
 /// Radians per second per rpm.
 pub const RPM_TO_RAD: f32 = 0.104_719_75;
@@ -119,17 +143,30 @@ const LSD_RAMP_COAST: f32 = 0.14;
 /// How hard the unit resists a speed difference, N.m per rad/s.
 const LSD_K: f32 = 60.0;
 
-/// What the drivetrain hands to the rear axle this substep.
+/// A driven wheel turning slower than this, with a brake on it that can hold
+/// whatever is trying to turn it, is locked: held at exactly zero rather than
+/// stepped, so it neither creeps nor chatters against the brake.
+const LOCKED: f32 = 0.5;
+/// The diagonal a locked wheel gets in the step: bolted to the floor.
+const BOLTED: f32 = 1e12;
+
+/// What the drivetrain did to the rear axle this substep. Telemetry now: the
+/// wheels themselves are moved inside [`Drivetrain::step`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Output {
+    /// Torque handed to each wheel at the start of the step, N.m.
     pub torque_l: f32,
     pub torque_r: f32,
-    /// `-d(wheel torque) / d(wheel speed)`, which the wheel integrator folds
-    /// into its implicit step. Without it a low gear couples a 0.22 kg.m^2
-    /// engine to a 1.2 kg.m^2 wheel hard enough to blow up at any sane rate.
-    pub coupling: f32,
     /// Engine speed as a fraction of the redline, for the tachometer.
     pub rpm: f32,
+}
+
+/// One driven wheel, as [`Drivetrain::step`] sees it: the wheel to move, what
+/// its tire is doing, and the brake torque on it this substep.
+pub struct Driven<'a> {
+    pub wheel: &'a mut Wheel,
+    pub patch: &'a Patch,
+    pub brake: f32,
 }
 
 /// Everything between the pedal and the axle that has to be remembered from one
@@ -220,12 +257,33 @@ pub fn gear_for(speed: f32) -> (f32, f32) {
 }
 
 impl Drivetrain {
-    /// Advance the engine and gearbox by `h` seconds and split the result
-    /// across the two driven wheels.
+    /// Advance the engine, gearbox, differential and both driven wheels by `h`
+    /// seconds, together. See the module docs for why together.
     ///
-    /// `w_rl` and `w_rr` are the rear wheel speeds in rad/s, `forward` the
-    /// car's signed forward speed (only used to decide about reverse).
-    pub fn step(&mut self, throttle: f32, w_rl: f32, w_rr: f32, forward: f32, h: f32) -> Output {
+    /// `intent` is the driver's key or stick, signed, and `pedal` where the
+    /// throttle pedal actually is after the foot, traction control and the
+    /// state of the engine bay have all had their say -- signed the same way.
+    /// They arrive separately because they mean different things: the gearbox
+    /// reads the intent for which way the driver wants to go, and the engine
+    /// gets the pedal. Handing the gearbox the pedal used to mean that
+    /// traction control closing the throttle in reverse read as the driver
+    /// letting go of the reverse key, and the box hunted between first and
+    /// reverse four times a second on a car that was asking, the whole time,
+    /// to back up.
+    ///
+    /// `forward` is the car's signed forward speed; `a_road` its longitudinal
+    /// acceleration over the previous substep, which the tire terms need for
+    /// the reason given at [`Wheel::spin`].
+    pub fn step(
+        &mut self,
+        intent: f32,
+        pedal: f32,
+        left: Driven,
+        right: Driven,
+        forward: f32,
+        a_road: f32,
+        h: f32,
+    ) -> Output {
         // A `CarState` that came from `Default` -- an empty slot, or a snapshot
         // written in from outside -- has a stopped engine in no gear. Rather
         // than let every caller remember to prime it, normalise here.
@@ -243,7 +301,7 @@ impl Drivetrain {
             // Only decide once the clutch is properly back in. Deciding while
             // it is still feeding would read an engine speed that the road is
             // not yet connected to, and shift again on the strength of it.
-            self.select(throttle, forward);
+            self.select(intent, forward);
         }
 
         // The clutch comes out for a shift and eases back in afterwards.
@@ -264,25 +322,38 @@ impl Drivetrain {
         let pedal = if self.shift > 0.0 {
             0.0
         } else if self.gear < 0.0 {
-            -throttle
+            -pedal
         } else {
-            throttle
+            pedal
         };
-
-        // --- clutch --------------------------------------------------------
-        let r = ratio(self.gear);
-        let w_diff = (w_rl + w_rr) * 0.5;
-        // Engine speed the road is currently demanding.
-        let w_in = w_diff * r;
-        let held = cap(self.engine) * self.clutch;
-        let t_clutch = clamp(CLUTCH_K * self.clutch * (self.engine - w_in), -held, held);
-
-        // --- engine --------------------------------------------------------
-        // Implicit in the clutch slope: at 90 N.m per rad/s against 0.22 kg.m^2
-        // an explicit step would need ~2.4 kHz to stay still.
         let t_eng = engine_torque(self.engine, pedal);
-        self.engine += h * (t_eng - t_clutch) / (I_ENGINE + h * CLUTCH_K * self.clutch);
-        self.engine = clamp(self.engine, STALL_FLOOR, REDLINE_RPM * RPM_TO_RAD);
+
+        // --- clutch, at the start of the step ------------------------------
+        // Linear in the slip until it reaches what it can hold, then a
+        // constant. Only the linear side goes into the Jacobian: a clutch at
+        // its cap is not a spring, and treating it as one would couple the
+        // engine to an axle it is in fact sliding over.
+        let r = ratio(self.gear);
+        let w_l = left.wheel.omega;
+        let w_r = right.wheel.omega;
+        let w_diff = (w_l + w_r) * 0.5;
+        let w_in = w_diff * r;
+        // What the plate can hold depends on which way it is being asked to.
+        // Driving, it tapers to nothing below `CLUTCH_LO`, which is what keeps
+        // the engine alive under a load and the car from creeping at idle. On
+        // the overrun -- the road turning the engine rather than the engine
+        // the road -- there is nothing to protect, an engine being dragged
+        // *up* cannot stall, and this is where engine braking comes from. It
+        // used to taper both ways, which left a car that had been spun with
+        // the handbrake coasting in gear at idle, the engine never picking the
+        // axle back up because the axle was the faster of the two.
+        let held = if self.engine >= w_in { cap(self.engine) } else { CLUTCH_CAP } * self.clutch;
+        let t_free = CLUTCH_K * self.clutch * (self.engine - w_in);
+        let (t_clutch, k_c) = if abs(t_free) >= held {
+            (signum(t_free) * held, 0.0)
+        } else {
+            (t_free, CLUTCH_K * self.clutch)
+        };
 
         // --- differential ---------------------------------------------------
         let t_diff = t_clutch * r * EFFICIENCY;
@@ -297,20 +368,92 @@ impl Drivetrain {
         };
         let ramp = if driving { LSD_RAMP_POWER } else { LSD_RAMP_COAST };
         let lock_cap = LSD_PRELOAD + ramp * abs(t_diff);
-        let lock = clamp(LSD_K * (w_rl - w_rr), -lock_cap, lock_cap);
+        let l_free = LSD_K * (w_l - w_r);
+        let (lock, k_l) = if abs(l_free) >= lock_cap {
+            (signum(l_free) * lock_cap, 0.0)
+        } else {
+            (l_free, LSD_K)
+        };
+
+        // --- brakes -----------------------------------------------------------
+        // A Coulomb torque against each wheel's rotation, and it goes *into*
+        // the step below rather than being applied after it. The rear brakes
+        // are slowing the flywheel as well as the wheel, through the clutch;
+        // applied afterwards as a step of their own they slowed only the
+        // wheel, and the clutch then dragged it straight back up to the
+        // engine's speed, so that under full braking the rear tires sat at one
+        // percent slip with 1500 N.m going nowhere. A wheel that has already
+        // stopped, and whose brake can hold whatever is trying to turn it, is
+        // simply held -- bolted to the floor for this substep, which is what a
+        // locked wheel is.
+        let push_l = base - lock + left.patch.torque;
+        let push_r = base + lock + right.patch.torque;
+        let locked_l = abs(w_l) < LOCKED && abs(push_l) <= left.brake;
+        let locked_r = abs(w_r) < LOCKED && abs(push_r) <= right.brake;
+        let brake_l = if locked_l { -push_l } else { -signum(w_l) * left.brake };
+        let brake_r = if locked_r { -push_r } else { -signum(w_r) * right.brake };
+
+        // --- the step -------------------------------------------------------
+        // Backward Euler on the three speeds, with every coupling linearised
+        // about the state above. Written out, with `d` the change in each
+        // speed over the step:
+        //
+        //   (I_e + h k_c) d_e    - b (d_l + d_r)                  = h (T_eng - T_c)
+        //   -c d_e + D_l d_l + e d_r                              = h (T_l + road_l)
+        //   -c d_e + e d_l + D_r d_r                              = h (T_r + road_r)
+        //
+        // where `b` and `c` carry the clutch through the gearing to and from
+        // the axle, `g` is the clutch's grip on one wheel through the gearing
+        // squared, and each wheel's diagonal is its inertia plus what the
+        // clutch, the diff and its own tire resist a change in its speed with.
+        // Eliminate the engine and the pair that is left is symmetric.
+        let g = k_c * r * r * EFFICIENCY * 0.25;
+        let a = I_ENGINE + h * k_c;
+        let b = h * k_c * r * 0.5;
+        let c = b * EFFICIENCY;
+        let d_l = if locked_l { BOLTED } else { wheel::INERTIA + h * (g + k_l + left.patch.slope) };
+        let d_r = if locked_r { BOLTED } else { wheel::INERTIA + h * (g + k_l + right.patch.slope) };
+        let e = h * (g - k_l);
+        // The road under each patch speeds up too; see `Wheel::spin`.
+        let road = h * a_road / wheel::RADIUS;
+        let b_e = h * (t_eng - t_clutch);
+        let b_l = h * (push_l + brake_l + left.patch.slope * road);
+        let b_r = h * (push_r + brake_r + right.patch.slope * road);
+
+        let inv_a = 1.0 / a;
+        let q = c * b * inv_a;
+        let m_ll = d_l - q;
+        let m_rr = d_r - q;
+        let m_lr = e - q;
+        let s_l = b_l + c * b_e * inv_a;
+        let s_r = b_r + c * b_e * inv_a;
+        let inv_det = 1.0 / (m_ll * m_rr - m_lr * m_lr);
+        let d_wl = (m_rr * s_l - m_lr * s_r) * inv_det;
+        let d_wr = (m_ll * s_r - m_lr * s_l) * inv_det;
+        let d_we = (b_e + b * (d_wl + d_wr)) * inv_a;
+
+        self.engine = clamp(self.engine + d_we, STALL_FLOOR, REDLINE_RPM * RPM_TO_RAD);
+        // A brake can stop a wheel inside the step but never reverse it.
+        left.wheel.omega = if locked_l || w_l * (w_l + d_wl) < 0.0 { 0.0 } else { w_l + d_wl };
+        right.wheel.omega = if locked_r || w_r * (w_r + d_wr) < 0.0 { 0.0 } else { w_r + d_wr };
 
         Output {
             torque_l: base - lock,
             torque_r: base + lock,
-            // Both the clutch (through the gearing, squared) and the diff resist
-            // a change in wheel speed.
-            coupling: CLUTCH_K * self.clutch * r * r * EFFICIENCY * 0.25 + LSD_K,
             rpm: self.engine / (REDLINE_RPM * RPM_TO_RAD),
         }
     }
 
     /// Pick a gear. Automatic, because the wire carries a throttle axis and not
     /// a shifter.
+    ///
+    /// Shift points are read off the road, not the crankshaft: the engine speed
+    /// the car's own speed implies in the current gear. The two agree whenever
+    /// the tires are gripping, and where they do not is exactly where the
+    /// engine is the wrong thing to read. Wheelspin off the line used to rev
+    /// the engine over the upshift point while the car was still doing
+    /// 30 km/h; the handbrake used to drag the engine to idle, and the box
+    /// down to first, on a car doing 140.
     fn select(&mut self, throttle: f32, forward: f32) {
         // Reverse is only available from a near-standstill, in both directions.
         if throttle < -0.02 && forward < REVERSE_BELOW && self.gear > 0.0 {
@@ -327,10 +470,11 @@ impl Drivetrain {
         }
 
         let top = GEARS.len() as f32;
-        if self.engine > UP_SHIFT && self.gear < top && throttle > 0.1 {
+        let road = abs(forward) / wheel::RADIUS * abs(ratio(self.gear));
+        if road > UP_SHIFT && self.gear < top && throttle > 0.1 {
             self.gear += 1.0;
             self.shift = SHIFT_TIME;
-        } else if self.engine < DOWN_SHIFT && self.gear > 1.0 {
+        } else if road < DOWN_SHIFT && self.gear > 1.0 {
             self.gear -= 1.0;
             self.shift = SHIFT_TIME;
         }
@@ -340,6 +484,34 @@ impl Drivetrain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A patch that will not let its wheel move: the axle bolted to the floor,
+    /// which is what "wheels held" means for the tests below.
+    const BOLTED: Patch = Patch {
+        fx: 0.0,
+        fy: 0.0,
+        mz: 0.0,
+        kappa: 0.0,
+        alpha: 0.0,
+        saturation: 0.0,
+        torque: 0.0,
+        slope: 1e12,
+    };
+
+    /// Step the drivetrain against wheels held at fixed speeds.
+    fn held(d: &mut Drivetrain, throttle: f32, w_rl: f32, w_rr: f32, forward: f32, h: f32) -> Output {
+        let mut l = Wheel { omega: w_rl, fy: 0.0 };
+        let mut r = Wheel { omega: w_rr, fy: 0.0 };
+        d.step(
+            throttle,
+            throttle,
+            Driven { wheel: &mut l, patch: &BOLTED, brake: 0.0 },
+            Driven { wheel: &mut r, patch: &BOLTED, brake: 0.0 },
+            forward,
+            0.0,
+            h,
+        )
+    }
 
     /// Gearing has to put a usable road speed in every gear, and let top gear
     /// out past what the car can actually reach.
@@ -374,7 +546,7 @@ mod tests {
         let w = d.engine / (GEARS[1] * FINAL_DRIVE);
         let mut ticks = 0;
         while d.shift > 0.0 && ticks < 480 {
-            d.step(1.0, w, w, w * crate::wheel::RADIUS, 1.0 / 480.0);
+            held(&mut d, 1.0, w, w, w * crate::wheel::RADIUS, 1.0 / 480.0);
             ticks += 1;
         }
         println!(
@@ -440,7 +612,7 @@ mod tests {
     fn engine_revs_against_a_stalled_car() {
         let mut d = Drivetrain::default();
         for _ in 0..480 {
-            d.step(1.0, 0.0, 0.0, 0.0, 1.0 / 480.0);
+            held(&mut d, 1.0, 0.0, 0.0, 0.0, 1.0 / 480.0);
         }
         let rpm = d.engine / RPM_TO_RAD;
         println!("one second at full throttle, wheels held: {rpm:.0} rpm");
@@ -456,7 +628,7 @@ mod tests {
     #[test]
     fn idle_in_gear_does_not_creep() {
         let mut d = Drivetrain::default();
-        let out = d.step(0.0, 0.0, 0.0, 0.0, 1.0 / 480.0);
+        let out = held(&mut d, 0.0, 0.0, 0.0, 0.0, 1.0 / 480.0);
         println!("at idle, in first, off the throttle: {:.1} N.m to the axle", out.torque_l + out.torque_r);
         assert_eq!(cap(IDLE), 0.0, "the clutch is holding torque at idle");
         assert!(abs(out.torque_l + out.torque_r) < 1.0);
@@ -467,7 +639,7 @@ mod tests {
     fn engine_cannot_be_stalled() {
         let mut d = Drivetrain::default();
         for _ in 0..2400 {
-            d.step(0.0, 0.0, 0.0, 0.0, 1.0 / 480.0);
+            held(&mut d, 0.0, 0.0, 0.0, 0.0, 1.0 / 480.0);
         }
         let rpm = d.engine / RPM_TO_RAD;
         println!("five seconds closed-throttle against a stopped axle: {rpm:.0} rpm");
@@ -479,12 +651,11 @@ mod tests {
     fn the_diff_sends_torque_to_the_slower_wheel() {
         let mut d = Drivetrain::default();
         // Left wheel spinning far faster than the right.
-        let out = d.step(1.0, 90.0, 40.0, 20.0, 1.0 / 480.0);
+        let out = held(&mut d, 1.0, 90.0, 40.0, 20.0, 1.0 / 480.0);
         println!("torque split with 50 rad/s across the axle: l {:.0} r {:.0}", out.torque_l, out.torque_r);
         assert!(out.torque_r > out.torque_l, "diff fed the spinning wheel");
     }
 
-    /// Lifting off has to give back torque, not just stop adding it.
     /// Reverse has to actually go backwards. The engine only turns one way, so
     /// a negative throttle means "press the pedal, in reverse gear" -- if that
     /// signed value reaches the torque curve unchanged it clamps to zero and
@@ -495,7 +666,7 @@ mod tests {
         // Stopped, asking for reverse.
         let mut out = Output::default();
         for _ in 0..480 {
-            out = d.step(-0.7, 0.0, 0.0, 0.0, 1.0 / 480.0);
+            out = held(&mut d, -0.7, 0.0, 0.0, 0.0, 1.0 / 480.0);
         }
         println!(
             "in reverse at {:.0} rpm: {:.0} N.m to the axle",
@@ -539,5 +710,92 @@ mod tests {
     fn the_limiter_cuts_fuel() {
         let over = LIMITER + 10.0;
         assert!(engine_torque(over, 1.0) < 0.0, "full throttle past the limiter still drives");
+    }
+
+    /// The whole reason for the coupled step: first gear bolts the engine to
+    /// the wheels through a ratio of fourteen, and the result has to sit still
+    /// at 480 Hz with the tires pushing back at tens of kN.m per unit slip.
+    #[test]
+    fn stays_stable_in_first_gear_under_load() {
+        let mut d = Drivetrain::default();
+        let (gear, engine) = gear_for(20.0);
+        d.gear = gear;
+        d.engine = engine;
+        let mut l = Wheel::default();
+        let mut r = Wheel::default();
+        l.roll_at(20.0);
+        r.roll_at(20.0);
+        let c = crate::wheel::Contact { u: 20.0, v: 0.0, fz: 2600.0, grip: 1.0 };
+        for _ in 0..2400 {
+            let pl = l.patch(&c, 1.0 / 480.0);
+            let pr = r.patch(&c, 1.0 / 480.0);
+            d.step(
+                1.0,
+                1.0,
+                Driven { wheel: &mut l, patch: &pl, brake: 0.0 },
+                Driven { wheel: &mut r, patch: &pr, brake: 0.0 },
+                20.0,
+                0.0,
+                1.0 / 480.0,
+            );
+            assert!(l.omega.is_finite() && abs(l.omega) < 1e4, "wheel blew up: {}", l.omega);
+            assert!(d.engine.is_finite(), "engine blew up");
+        }
+        println!("full throttle in first at 20 m/s for 5 s: wheel {:.1} rad/s, engine {:.0} rpm", l.omega, d.engine / RPM_TO_RAD);
+    }
+
+    /// Under steady acceleration the engine and the axle speed up together and
+    /// the clutch torque does not change, so the step must hand the road the
+    /// engine's torque less what its own inertia takes -- and give the same
+    /// answer at any substep. The one-body-at-a-time version lost a fifth of a
+    /// g here and did not.
+    #[test]
+    fn steady_acceleration_loses_nothing_to_the_integrator() {
+        // A heavily loaded tire so it can carry the whole engine without
+        // saturating: the drive force is then read straight off the patch.
+        let drive_at = |div: u32| {
+            let h = 1.0 / (480.0 * div as f32);
+            let mut d = Drivetrain::default();
+            d.gear = 1.0;
+            let mut l = Wheel::default();
+            let mut r = Wheel::default();
+            let mut u = 8.0f32;
+            l.roll_at(u);
+            r.roll_at(u);
+            d.engine = u / crate::wheel::RADIUS * ratio(1.0);
+            let a = 7.0f32;
+            let mut fx = 0.0;
+            for _ in 0..240 * div {
+                let c = crate::wheel::Contact { u, v: 0.0, fz: 12_000.0, grip: 1.0 };
+                let pl = l.patch(&c, h);
+                let pr = r.patch(&c, h);
+                fx = pl.fx + pr.fx;
+                d.step(
+                    1.0,
+                    1.0,
+                    Driven { wheel: &mut l, patch: &pl, brake: 0.0 },
+                    Driven { wheel: &mut r, patch: &pr, brake: 0.0 },
+                    u,
+                    a,
+                    h,
+                );
+                u += a * h;
+            }
+            (fx, d.engine)
+        };
+        let (coarse, engine) = drive_at(1);
+        let (fine, _) = drive_at(16);
+        // What the engine has to give at that speed, less its own inertia,
+        // less the two wheels', through the gearing.
+        let alpha = 7.0 / crate::wheel::RADIUS;
+        let expected = (engine_torque(engine, 1.0) - I_ENGINE * ratio(1.0) * alpha) * ratio(1.0) * EFFICIENCY
+            / crate::wheel::RADIUS
+            - 2.0 * wheel::INERTIA * alpha / crate::wheel::RADIUS
+            - 2.0 * crate::aero::ROLL_RESIST * 12_000.0;
+        println!(
+            "first gear, 7 m/s^2: {coarse:.0} N at 480 Hz, {fine:.0} N at 7680 Hz, torque balance says {expected:.0} N"
+        );
+        assert!(abs(coarse - fine) < expected * 0.05, "drive force depends on the substep");
+        assert!(abs(coarse - expected) < expected * 0.08, "integrator is eating torque");
     }
 }

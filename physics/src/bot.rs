@@ -132,7 +132,11 @@ impl BotBrain {
         // on the way in, run backwards.
         let dmg = car.damage();
         let lock = crate::car::steer_lock(speed) * dmg.steer_lock();
-        let steer = clamp((delta - dmg.steer_pull()) / lock, -1.0, 1.0);
+        // The aid damps slides for a driver with no hands to do it; this one
+        // has the yaw-rate term above, so take the aid's share back out.
+        let vb = car.vel().to_local(car.heading);
+        let damp = crate::car::steer_damp(vb.x, vb.y, car.omega, car.ay, car.slip_r, lock);
+        let steer = clamp((delta - dmg.steer_pull() - damp) / lock, -1.0, 1.0);
 
         // --- speed ---------------------------------------------------------
         let horizon = clamp(50.0 + speed * 2.6, 50.0, 240.0);

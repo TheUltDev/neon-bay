@@ -82,6 +82,7 @@ export const F = {
   bestLap: 36, impact: 37, wall: 38,
   dmgFront: 39, dmgRear: 40, dmgLeft: 41, dmgRight: 42,
   active: 43,
+  pedal: 44, brakePedal: 45,
 } as const;
 
 export interface WasmExports {

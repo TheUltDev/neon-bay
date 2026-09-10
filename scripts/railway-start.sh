@@ -44,6 +44,21 @@ LOCAL="http://127.0.0.1:${PORT}"
 log() { printf '[boot] %s\n' "$*"; }
 die() { printf '[boot] %s\n' "$*" >&2; exit 1; }
 
+# The one failure neither the retries nor the recreate below can reach: if the
+# volume is full or the database on it will not open, SpacetimeDB has to write
+# before it can answer /v1/ping, so it dies during startup and the container
+# never gets as far as publishing anything. Nothing inside can fix that, and
+# there is no shell on a container that exits in a second. Setting
+# STDB_WIPE_DATA discards the database on the next boot and nothing else: the
+# keypair and cli.toml beside it are what make this the same server to a
+# returning player, and the next boot creates the database from scratch the
+# same way an empty volume does. Unset it once the container is up, because
+# while it is set every restart starts an empty race.
+if [ -n "${STDB_WIPE_DATA:-}" ]; then
+  log "STDB_WIPE_DATA is set -- discarding ${DATA_DIR}"
+  rm -rf "${DATA_DIR:?}"
+fi
+
 mkdir -p "$DATA_DIR" "$KEY_DIR" || die "could not create directories under ${STATE_DIR}"
 
 log "SpacetimeDB on 0.0.0.0:${PORT}, data dir ${DATA_DIR}, keys ${KEY_DIR}"
