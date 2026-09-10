@@ -29,6 +29,30 @@ pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
 
+/// Explicit comparisons rather than `f32::max` / `f32::min`.
+///
+/// The library versions disagree with wasm's `f32.max` about NaN, so Rust emits
+/// a fix-up on that target and not on x86-64. The answers still match for
+/// ordinary inputs, but "ordinary inputs" is not a claim this crate is willing
+/// to make about arithmetic the netcode depends on being bit-identical.
+#[inline]
+pub fn max(a: f32, b: f32) -> f32 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+#[inline]
+pub fn min(a: f32, b: f32) -> f32 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
 #[inline]
 pub fn signum(v: f32) -> f32 {
     if v > 0.0 {
@@ -115,6 +139,14 @@ fn poly_atan(x: f32) -> f32 {
     const A11: f32 = -0.011_721_2;
     let x2 = x * x;
     x * (A1 + x2 * (A3 + x2 * (A5 + x2 * (A7 + x2 * (A9 + x2 * A11)))))
+}
+
+/// `tan` via the pair, which is all the steering geometry needs. Blows up near
+/// +/-PI/2, which no steering angle here goes anywhere near.
+#[inline]
+pub fn tan(a: f32) -> f32 {
+    let (s, c) = sin_cos(a);
+    s / c
 }
 
 #[inline]
@@ -275,6 +307,15 @@ mod tests {
                 }
                 approx(atan2(y, x), y.atan2(x), 3e-6);
             }
+        }
+    }
+
+    #[test]
+    fn tan_matches_libm() {
+        let mut a = -1.4f32;
+        while a < 1.4 {
+            approx(tan(a), a.tan(), 2e-5);
+            a += 0.011;
         }
     }
 

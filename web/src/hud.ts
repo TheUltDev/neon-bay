@@ -37,6 +37,11 @@ export interface HudState {
   speedKph: number;
   gear: number;
   rpm: number;
+  /** Lateral acceleration in g. Real, now that load transfer is: it is
+   *  what the four contact patches actually managed between them. */
+  latG: number;
+  /** Worst crush on the body, 0 (straight) to 1 (written off). */
+  damage: number;
   throttle: number;
   brake: number;
   steer: number;
@@ -210,7 +215,20 @@ export class Hud {
     this.set('k-resync', `${s.resyncs}`);
 
     this.set('k-speed', Math.round(s.speedKph).toString());
-    this.set('k-gear', s.gear.toString());
+    this.set('k-gear', gearLabel(s.gear));
+    this.set('k-latg', Math.abs(s.latG).toFixed(2));
+    // The car peaks somewhere between 1.3 g and 1.7 g depending on how
+    // much downforce the speed is worth, so 1.2 is 'leaning on it'.
+    this.css('k-latg', 'color', Math.abs(s.latG) > 1.2 ? 'var(--amber)' : 'var(--text)');
+    // Bodywork. Not cosmetic: past about a third of this the car has visibly
+    // less downforce, less lock, less power and less grip, and the driver
+    // deserves to be told which of those they are now driving around.
+    this.set('k-dmg', s.damage < 0.02 ? 'OK' : `${Math.round(s.damage * 100)}%`);
+    this.css(
+      'k-dmg',
+      'color',
+      s.damage > 0.6 ? 'var(--pink)' : s.damage > 0.2 ? 'var(--amber)' : 'var(--text)',
+    );
     this.css('bar-thr', 'width', `${(Math.max(0, s.throttle) * 100).toFixed(1)}%`);
     this.css('bar-brk', 'width', `${(s.brake * 100).toFixed(1)}%`);
     this.css('bar-str', 'width', `${(Math.abs(s.steer) * 50).toFixed(1)}%`);
@@ -378,7 +396,7 @@ export class Hud {
       g.fillText(`${Math.round(kph)}`, cx, cy + 6);
       g.fillStyle = '#ffc857';
       g.font = '10px ui-monospace, monospace';
-      g.fillText(`G${gear}`, cx, cy + 18);
+      g.fillText(gearLabel(gear), cx, cy + 18);
       g.textAlign = 'left';
     }
   }
@@ -423,7 +441,15 @@ function trim(n: number): string {
   return n.toFixed(2).replace(/\.?0+$/, '');
 }
 
-export function fmtTime(seconds: number): string {
+export /** What the gearbox is in. `-1` is reverse on the wire; nobody wants to read
+ *  "G-1" through a corner. */
+function gearLabel(gear: number): string {
+  if (gear < 0) return 'R';
+  if (gear < 1) return 'N';
+  return `G${Math.round(gear)}`;
+}
+
+function fmtTime(seconds: number): string {
   if (!isFinite(seconds) || seconds <= 0) return '0:00.00';
   const m = Math.floor(seconds / 60);
   const s = seconds - m * 60;

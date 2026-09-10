@@ -34,12 +34,28 @@ const SNAP_DISTANCE = 9.0;
 /** Time constant for bleeding off a visual correction. */
 const SMOOTH_TIME = 0.22;
 
-/** Field offsets inside a CarState record. Mirrors physics::car::CarState. */
+/**
+ * Field offsets inside a CarState record. Mirrors `physics::car::CarState`
+ * field for field, in declaration order -- the wasm module hands this over as
+ * raw memory, so an offset that is wrong here reads a neighbouring quantity
+ * rather than failing.
+ *
+ * Most of it is the vehicle's internal state rather than its pose: four wheel
+ * speeds, four tires part way through building up their cornering force, the
+ * body's roll and pitch, and the drivetrain. Rollback replays from all of it.
+ */
 export const F = {
-  x: 0, y: 1, heading: 2, vx: 3, vy: 4, omega: 5, steer: 6, ax: 7,
-  slipF: 8, slipR: 9, wheelSpin: 10, rpm: 11, gear: 12, s: 13, lat: 14,
-  seg: 15, lap: 16, cp: 17, lapStart: 18, lastLap: 19, bestLap: 20,
-  impact: 21, wall: 22, active: 23,
+  x: 0, y: 1, heading: 2, vx: 3, vy: 4, omega: 5, steer: 6,
+  wFl: 7, wFr: 8, wRl: 9, wRr: 10,
+  fyFl: 11, fyFr: 12, fyRl: 13, fyRr: 14,
+  roll: 15, rollRate: 16, pitch: 17, pitchRate: 18,
+  engine: 19, gear: 20, shift: 21, clutch: 22,
+  ax: 23, ay: 24,
+  slipF: 25, slipR: 26, wheelSpin: 27, rpm: 28,
+  s: 29, lat: 30, seg: 31, lap: 32, cp: 33, lapStart: 34, lastLap: 35,
+  bestLap: 36, impact: 37, wall: 38,
+  dmgFront: 39, dmgRear: 40, dmgLeft: 41, dmgRight: 42,
+  active: 43,
 } as const;
 
 export interface WasmExports {
@@ -90,6 +106,12 @@ export interface CarConsts {
   halfWid: number;
   maxCars: number;
   carFloats: number;
+  /** Rolling radius, meters. Needed to turn a road speed into a wheel speed. */
+  wheelRadius: number;
+  /** Road speed below which the gearbox will change direction, m/s. */
+  reverseBelow: number;
+  /** Crush at which a panel has nothing left to give, metres. */
+  maxCrush: number;
 }
 
 export type Input = { throttle: number; steer: number; brake: number; handbrake: number };
@@ -200,7 +222,15 @@ export class Sim {
     );
 
     const c = new Float32Array(wasm.memory.buffer, wasm.phys_consts_ptr(), wasm.phys_consts_len());
-    this.consts = { halfLen: c[0], halfWid: c[1], maxCars, carFloats: this.stride };
+    this.consts = {
+      halfLen: c[0],
+      halfWid: c[1],
+      maxCars,
+      carFloats: this.stride,
+      wheelRadius: c[12],
+      reverseBelow: c[13],
+      maxCrush: c[14],
+    };
 
     this.track = readTrack(wasm, c);
 
@@ -421,6 +451,18 @@ export class Sim {
     const h = this.cars[b + F.heading];
     this.cars[b + F.vx] += Math.cos(h) * boost;
     this.cars[b + F.vy] += Math.sin(h) * boost;
+    // Spin the wheels up to match. A body suddenly doing 26 m/s more than its
+    // tires are turning is not a cheating client, it is a car with all four
+    // wheels locked: the tire model reads the mismatch as a large negative slip
+    // ratio, and a saturated contact patch has nothing left for cornering. The
+    // car would bleed the invented speed back and understeer into the barrier
+    // rather than reach the authority for it to disagree with. A client lying
+    // about where it is lies consistently.
+    const dw = boost / this.consts.wheelRadius;
+    this.cars[b + F.wFl] += dw;
+    this.cars[b + F.wFr] += dw;
+    this.cars[b + F.wRl] += dw;
+    this.cars[b + F.wRr] += dw;
   }
 }
 

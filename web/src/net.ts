@@ -15,7 +15,7 @@ import { F, wrapPi } from './sim';
 
 export interface Snapshot {
   tick: number;
-  /** Full 24-float CarState record, ready to hand straight to the wasm sim. */
+  /** Full CarState record, ready to hand straight to the wasm sim. */
   state: Float32Array;
   ackSeq: number;
   /** performance.now() when this landed, for latency estimation. */
@@ -150,7 +150,10 @@ export class Net {
    *  couple of hundred short-lived typed arrays a frame, which Firefox collects
    *  as visible hitches; every caller reads the result out before asking for
    *  the next one, so one buffer does. */
-  private sampleOut = new Float32Array(24);
+  // Sized from `F` rather than a literal, so growing the record -- as adding
+  // four wheels, four tire forces and a drivetrain to it did -- cannot leave a
+  // scratch buffer behind that silently overruns on the first remote car.
+  private sampleOut = new Float32Array(Object.keys(F).length);
   private recordsCache: LapRecordRow[] = [];
   private recordsAt = 0;
 
@@ -439,19 +442,31 @@ export class Net {
   }
 
   /**
-   * Turn a row into the exact 24-float record the wasm simulation uses.
+   * Turn a row into the exact 44-float record the wasm simulation uses.
    *
    * Positional, in `F` order -- the same `#[repr(C)]` layout the sim maps over
-   * wasm memory. The two fields not on the wire (`slip_f`, `slip_r`) are
+   * wasm memory. Nearly all of it is simulation state rather than pose, and it
+   * has to be: rewinding to an authoritative tick and replaying only works if
+   * the car being replayed is the same car, down to how fast each wheel is
+   * turning and how far the body has rolled.
+   *
+   * The two fields not on the wire (`slip_f`, `slip_r`) are telemetry, and are
    * overwritten before they are ever read, so reconstructing them as zero is
    * exact rather than approximate.
    */
   private toRecord(row: CarStateRow): Float32Array {
     return Float32Array.of(
-      row.x, row.y, row.heading, row.vx, row.vy, row.omega, row.steer, row.ax,
-      0, 0, row.wheelSpin, row.rpm, row.gear, row.s, row.lat, row.seg,
-      row.lap, row.cp, row.lapStart, row.lastLap, row.bestLap, row.impact,
-      row.wall ? 1 : 0, 1,
+      row.x, row.y, row.heading, row.vx, row.vy, row.omega, row.steer,
+      row.wFl, row.wFr, row.wRl, row.wRr,
+      row.fyFl, row.fyFr, row.fyRl, row.fyRr,
+      row.roll, row.rollRate, row.pitch, row.pitchRate,
+      row.engine, row.gear, row.shift, row.clutch,
+      row.ax, row.ay,
+      0, 0, row.wheelSpin, row.rpm,
+      row.s, row.lat, row.seg, row.lap, row.cp, row.lapStart, row.lastLap,
+      row.bestLap, row.impact, row.wall ? 1 : 0,
+      row.dmgFront, row.dmgRear, row.dmgLeft, row.dmgRight,
+      1,
     );
   }
 
@@ -742,6 +757,11 @@ export class Net {
 
 /** Fields that interpolate linearly. Hoisted out of `lerpState`: it runs for
  *  every remote car on every fixed step. */
+// What is worth blending between two snapshots of somebody else's car. The
+// client never simulates a rival, so this is only what gets drawn or heard:
+// where it is, which way its wheels point, how hard it is sliding, and how
+// fast its engine is turning. Its wheel speeds and suspension travel are on
+// the wire for rollback, not for rendering, and are left alone.
 const LERP = [F.x, F.y, F.vx, F.vy, F.omega, F.steer, F.wheelSpin, F.rpm, F.s, F.lat];
 
 function lerpState(out: Float32Array, a: Float32Array, b: Float32Array, t: number): Float32Array {

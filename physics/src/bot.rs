@@ -17,12 +17,25 @@ pub struct BotBrain {
     pub line_bias: f32,
     /// Phase offset so the wobble of two bots never lines up.
     pub phase: f32,
-    /// Grip the driver *plans* for. Below the car's real limit on purpose --
-    /// the margin is what stops every apex being reached sideways.
+    /// Fraction of the car's *real* limit the driver plans for.
+    ///
+    /// It used to be an absolute number of g, which only worked while the car
+    /// had a fixed amount of grip. It no longer does: downforce adds grip with
+    /// speed and load sensitivity takes some back in the transfer, so the
+    /// driver asks [`crate::car::grip_limit`] what is actually available and
+    /// keeps this much of it. The rest is the margin that stops every apex
+    /// being arrived at sideways.
     pub plan_grip: f32,
     /// Yaw-rate feedback gain. Higher is twitchier but catches slides sooner.
     pub yaw_gain: f32,
 }
+
+/// Ticks the recovery drives each way before trying the other one.
+///
+/// A second and a quarter, and it needs to be: a gear change is 120 ms and the
+/// clutch takes as long again to come back in, so a shorter phase spends most
+/// of itself waiting for the drivetrain and never gets a shove out of it.
+const ROCK_TICKS: u64 = 75;
 
 impl BotBrain {
     pub fn new(seed: u32) -> Self {
@@ -38,7 +51,7 @@ impl BotBrain {
             skill: 0.86 + next() * 0.19,
             line_bias: (next() - 0.5) * 3.0,
             phase: next() * 6.28,
-            plan_grip: 1.35,
+            plan_grip: 0.60,
             yaw_gain: 0.16,
         }
     }
@@ -95,7 +108,12 @@ impl BotBrain {
         // tires can actually deliver and converted back into a steering angle.
         // The yaw-rate feedback term doubles as automatic opposite lock: in a
         // slide the measured rate overshoots the command and the wheel unwinds.
-        let grip = self.plan_grip * 1.15 * self.skill;
+        // What this car can really do at this speed, in g. Rises with
+        // downforce, which is why a bot carries more speed through a fast
+        // sweeper than through a hairpin of the same radius.
+        let limit = crate::car::grip_limit(speed, &car.damage()) / (crate::car::MASS * crate::car::G);
+        let plan_grip = limit * self.plan_grip * self.skill;
+        let grip = plan_grip * 1.15;
         let to_target = target.sub(car.pos());
         let dist = if to_target.len() > 5.0 { to_target.len() } else { 5.0 };
         let local = to_target.to_local(car.heading);
@@ -106,12 +124,17 @@ impl BotBrain {
         let omega_cmd = clamp(omega_des, -omega_max, omega_max);
         let delta = crate::math::atan(crate::car::WHEELBASE * omega_cmd / v)
             + (omega_cmd - car.omega) * self.yaw_gain;
-        let steer = clamp(delta / crate::car::steer_lock(speed), -1.0, 1.0);
+        // Back out the input that produces that road-wheel angle *in this car*.
+        // A damaged one has less lock to give and a permanent pull built into
+        // its geometry, and a driver who does not hold against the pull keeps
+        // arriving back at the barrier that put it there -- which is a spiral,
+        // not a consequence. This is the same arithmetic `car::integrate` does
+        // on the way in, run backwards.
+        let dmg = car.damage();
+        let lock = crate::car::steer_lock(speed) * dmg.steer_lock();
+        let steer = clamp((delta - dmg.steer_pull()) / lock, -1.0, 1.0);
 
         // --- speed ---------------------------------------------------------
-        // Assume a bit less grip than the car really has -- the margin is what
-        // keeps a bot from arriving at every apex already sideways.
-        let plan_grip = self.plan_grip * self.skill;
         let horizon = clamp(50.0 + speed * 2.6, 50.0, 240.0);
         let target_speed = clamp(track.speed_limit(car.s, horizon, plan_grip), 7.0, 80.0);
 
@@ -134,21 +157,69 @@ impl BotBrain {
         let by_slide = 1.0 - clamp((abs(car.slip_r) - 0.14) * 3.2, 0.0, 0.85) * slide_trust;
         throttle = clamp(throttle, 0.0, by_speed * by_steer * by_slide);
 
-        // Recovery. A spun-out bot that keeps chasing a look-ahead point 40 m
-        // away just spins faster, so take over and point it down the road.
+        // --- recovery -------------------------------------------------------
+        // A spun-out bot that keeps chasing a look-ahead point 40 m away just
+        // spins faster, and one wedged against a barrier will sit there
+        // spinning its wheels for the rest of the race. Both need the driver
+        // taken away from it.
         let (_, tan_here, _) = track.sample(car.s + 6.0);
         let facing_err = wrap_pi(atan2(tan_here.y, tan_here.x) - car.heading);
-        if speed < 9.0 && abs(facing_err) > 0.55 {
-            if abs(facing_err) > 2.0 {
+
+        // Stopped *and* actually in contact with something. `wall` is set by
+        // the collision solver when a corner of the body is outside the
+        // barrier, so this is the car reporting a contact rather than the
+        // driver inferring one from how wide it is running -- which fires on
+        // any bot taking a normal wide line and pitches it into reverse.
+        let wedged = speed < 3.0 && car.wall > 0.5;
+        let reversing = fwd_speed < -0.5;
+        // Hysteresis on the threshold, so a car part way through backing out
+        // does not change its mind and drive into the barrier again.
+        let too_far_round = abs(facing_err) > if reversing { 0.8 } else { 1.4 };
+
+        if wedged || (speed < 9.0 && abs(facing_err) > 0.55) {
+            // A car that is genuinely pinned may be pinned in exactly the
+            // direction it is pointing, and backing out of a barrier it is
+            // wedged into can drive it further in. So rock it, which is what a
+            // person does with a car that will not come free, and which needs
+            // no memory to run -- the tick counter is the same on the
+            // authority and in the browser.
+            //
+            // The clock only gets a say while the car is genuinely stopped.
+            // Two things went wrong when it had a wider one. It used to be
+            // `wedged` that chose between the clock and the compass, and
+            // `wedged` reads a contact flag that goes on and off between one
+            // tick and the next as a corner rests on the barrier line, so the
+            // driver changed its mind several times a second -- which rocks a
+            // car at a frequency that builds no speed at all. And asking for
+            // reverse from a car that is already rolling forwards achieves
+            // nothing whatever: the gearbox will not select it at speed and a
+            // negative pedal is not a negative torque, so the car coasts, stays
+            // under the threshold that got it here, and is asked again. Either
+            // way a bot could spend a whole race travelling four metres.
+            let back = if speed < 0.8 {
+                (tick / ROCK_TICKS) % 2 == 0
+            } else {
+                too_far_round
+            };
+            if back {
+                // Back out properly. A third of a pedal used to seem like the
+                // careful thing to ask for, on the grounds that reverse is
+                // geared short enough to light the rear tires up -- but it is
+                // not enough to lift the engine off idle against a clutch that
+                // is barely engaged at idle, so the car creeps at a fifth of a
+                // metre a second and never gets anywhere. Traction control is
+                // direction-aware and will take back whatever is too much.
+                // Steering is negated because reversing swings the nose the
+                // other way.
                 return CarInput {
-                    throttle: -0.7,
+                    throttle: -0.75,
                     steer: clamp(-facing_err * 0.9, -1.0, 1.0),
                     brake: 0.0,
                     handbrake: 0.0,
                 };
             }
             return CarInput {
-                throttle: 0.42,
+                throttle: 0.6,
                 steer: clamp(facing_err * 2.2, -1.0, 1.0),
                 brake: 0.0,
                 handbrake: 0.0,

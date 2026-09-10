@@ -19,7 +19,10 @@ import type { Sim } from '../sim';
 import { BaseRenderer, MARK_SIZE, TIRE_WIDTH } from './base';
 import { Mode, Tex, type GpuDevice, type GpuMesh } from './device';
 import { MeshBuilder } from './mesh';
-import { ASPHALT_TILE, CAR_OUTLINE, EDGE_GLOW, EDGE_RGB, hslRgb, shadeRgb, WHEELS } from './palette';
+import {
+  ASPHALT_TILE, CAR_HULL, CAR_HULL_N, crushOutline,
+  EDGE_GLOW, EDGE_RGB, hslRgb, lampOut, shadeRgb, WHEELS, WING_LOST,
+} from './palette';
 import type { DrawCar, GhostCar, RendererInfo } from './types';
 
 /** Where the two brake lights sit along the tail. */
@@ -381,6 +384,9 @@ export class GpuRenderer extends BaseRenderer {
 
   private emitCar(c: DrawCar) {
     const mb = this.world;
+    // The shape this car is now, in its own frame. See `crushOutline`.
+    const hull = crushOutline(c.dmgFront, c.dmgRear, c.dmgLeft, c.dmgRight);
+    const grade = Math.round(c.damage * 4);
     const r = ((c.color >> 16) & 255) / 255;
     const g = ((c.color >> 8) & 255) / 255;
     const b = (c.color & 255) / 255;
@@ -411,23 +417,27 @@ export class GpuRenderer extends BaseRenderer {
     // off the 2D renderer, not guessed. A blurred edge would sit at half the
     // shadow's own alpha; a car is narrow enough for its far side to take some
     // of that back.
-    mb.halo(CAR_OUTLINE, 8, spread, r, g, b, 0.45);
-    this.emitBody(c.color);
+    mb.halo(hull, CAR_HULL_N, spread, r, g, b, 0.45);
+    this.emitBody(hull, c.color, grade);
 
     // Cockpit and accents.
     mb.color255(10, 16, 26, 0.85);
     mb.roundRect(-0.55, -0.62, 1.15, 1.24, 0.28);
     mb.color255(255, 255, 255, 0.16);
     mb.rect(-1.9, -0.12, 3.4, 0.24);
-    const wing = shadeRgb(c.color, -0.6);
-    mb.color(wing[0], wing[1], wing[2], 1);
-    mb.roundRect(-2.15, -0.95, 0.34, 1.9, 0.1);
+    // Rear wing, until something takes it off.
+    if (c.dmgRear < WING_LOST) {
+      const wing = shadeRgb(c.color, -0.6);
+      mb.color(wing[0], wing[1], wing[2], 1);
+      mb.roundRect(-2.15, -0.95, 0.34, 1.9, 0.1);
+    }
 
-    // Headlights and their beam, which fades out over ten metres.
+    // Headlights and their beam, which fades out over ten metres. A folded
+    // nose takes the lamp on that corner with it.
     if (c.speed > 0.5 || c.throttle > 0) {
       mb.color255(255, 244, 214, 0.95);
-      mb.rect(1.92, -0.78, 0.2, 0.4);
-      mb.rect(1.92, 0.38, 0.2, 0.4);
+      if (!lampOut(c.dmgFront, c.dmgLeft, c.dmgRight, 1)) mb.rect(1.92, -0.78, 0.2, 0.4);
+      if (!lampOut(c.dmgFront, c.dmgLeft, c.dmgRight, -1)) mb.rect(1.92, 0.38, 0.2, 0.4);
       const br = 1;
       const bg = 240 / 255;
       const bb = 200 / 255;
@@ -451,7 +461,12 @@ export class GpuRenderer extends BaseRenderer {
 
     if (c.isLocal) {
       mb.color255(255, 255, 255, 0.55);
-      mb.ribbon(CAR_OUTLINE, 8, 0.07, true);
+      mb.ribbon(hull, CAR_HULL_N, 0.07, true);
+    }
+    // Buckled metal catches the light along the fold.
+    if (grade > 0) {
+      mb.color255(12, 14, 20, 0.2 + 0.13 * grade);
+      mb.ribbon(hull, CAR_HULL_N, 0.06, true);
     }
     mb.pop();
   }
@@ -461,11 +476,13 @@ export class GpuRenderer extends BaseRenderer {
    * vertices: lighter along the top edge, the car's own colour just above the
    * middle, darkest at the bottom.
    */
-  private emitBody(color: number) {
+  private emitBody(hull: Float32Array, color: number, grade: number) {
     const mb = this.world;
-    const top = shadeRgb(color, -0.35);
-    const mid: [number, number, number] = [((color >> 16) & 255) / 255, ((color >> 8) & 255) / 255, (color & 255) / 255];
-    const bot = shadeRgb(color, -0.55);
+    // Paint does not survive an accident either.
+    const dirt = -0.09 * grade;
+    const top = shadeRgb(color, -0.35 + dirt);
+    const mid = shadeRgb(color, dirt);
+    const bot = shadeRgb(color, -0.55 + dirt);
     const at = (y: number) => {
       const t = Math.min(1, Math.max(0, (y + 1) / 2));
       const low = t < 0.45;
@@ -481,20 +498,21 @@ export class GpuRenderer extends BaseRenderer {
       const c = at(y);
       mb.vertC(x, y, 0, 0, c[0], c[1], c[2], 1);
     };
-    for (let i = 0; i < 8; i++) {
-      const j = (i + 1) % 8;
+    for (let i = 0; i < CAR_HULL_N; i++) {
+      const j = (i + 1) % CAR_HULL_N;
       put(0, 0);
-      put(CAR_OUTLINE[i * 2], CAR_OUTLINE[i * 2 + 1]);
-      put(CAR_OUTLINE[j * 2], CAR_OUTLINE[j * 2 + 1]);
+      put(hull[i * 2], hull[i * 2 + 1]);
+      put(hull[j * 2], hull[j * 2 + 1]);
     }
   }
+
 
   /** The authority's pose, drawn as a dashed wireframe next to the prediction. */
   private emitGhost(g: GhostCar) {
     const mb = this.world;
     mb.push(g.x, g.y, g.heading);
     mb.color255(120, 255, 214, 0.75);
-    mb.dashed(CAR_OUTLINE, 8, true, 0.45, 0.32, 0.09);
+    mb.dashed(CAR_HULL, CAR_HULL_N, true, 0.45, 0.32, 0.09);
     mb.color255(120, 255, 214, 0.9);
     mb.circle(0, 0, 0.16, 12);
     mb.pop();

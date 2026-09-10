@@ -22,6 +22,13 @@ export interface DrawCar {
   braking: boolean;
   throttle: number;
   lap: number;
+  /** Crush on each face, in metres: the shape the body is drawn as. */
+  dmgFront: number;
+  dmgRear: number;
+  dmgLeft: number;
+  dmgRight: number;
+  /** The worst of them, 0 (straight) to 1 (written off). */
+  damage: number;
 }
 
 export interface GhostCar {

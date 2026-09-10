@@ -345,7 +345,7 @@ async function boot() {
       acc -= DT;
       steps++;
       if (sim.localSlot >= 0) {
-        const input = controls.read(forwardSpeed(sim));
+        const input = controls.read(forwardSpeed(sim), sim.consts.reverseBelow);
         // Stamp the tick this input *drives*, i.e. the one before the step it is
         // about to take. The sidecar holds it until its own clock reaches that
         // tick, which is what keeps the two simulations in lockstep.
@@ -461,6 +461,7 @@ function placeRemotes(sim: Sim, net: Net, atTick: number) {
 }
 
 function collectCars(sim: Sim, net: Net, atTick: number, alpha: number): DrawCar[] {
+  const spent = sim.consts.maxCrush;
   const out: DrawCar[] = [];
   for (const meta of net.cars.values()) {
     // Both sources are the same `#[repr(C)]` record: the wasm world holds one
@@ -487,6 +488,17 @@ function collectCars(sim: Sim, net: Net, atTick: number, alpha: number): DrawCar
       braking: local && sim.inputs[meta.slot * 4 + 2] > 0.1,
       throttle: local ? sim.inputs[meta.slot * 4] : 1,
       lap: s[b + F.lap],
+      // Crush comes off the wire like everything else, so a car that has been
+      // in an accident looks like it from every browser watching -- including
+      // the ones that never saw the accident.
+      dmgFront: s[b + F.dmgFront],
+      dmgRear: s[b + F.dmgRear],
+      dmgLeft: s[b + F.dmgLeft],
+      dmgRight: s[b + F.dmgRight],
+      damage: Math.min(
+        1,
+        Math.max(s[b + F.dmgFront], s[b + F.dmgRear], s[b + F.dmgLeft], s[b + F.dmgRight]) / spent,
+      ),
     });
   }
   return out;
@@ -525,9 +537,15 @@ const SIDES = [1, -1];
 
 function spawnEffects(renderer: Renderer, cars: DrawCar[], dt: number) {
   for (const c of cars) {
-    if (c.speed < 6 || c.wheelSpin < 0.3) continue;
     const cs = Math.cos(c.heading);
     const sn = Math.sin(c.heading);
+    // A folded nose is a folded radiator, which is the same thing the engine
+    // is losing its power to -- so the smoke and the missing horsepower have
+    // one cause and arrive together.
+    if (c.dmgFront > SMOKING_NOSE && Math.random() < (c.dmgFront - SMOKING_NOSE) * dt * 40) {
+      renderer.addSmoke(c.x + cs * 1.9, c.y + sn * 1.9, -cs * 1.5, -sn * 1.5, 0.55);
+    }
+    if (c.speed < 6 || c.wheelSpin < 0.3) continue;
     for (const side of SIDES) {
       const wx = c.x - cs * REAR_AXLE - sn * REAR_TRACK * side;
       const wy = c.y - sn * REAR_AXLE + cs * REAR_TRACK * side;
@@ -540,6 +558,9 @@ function spawnEffects(renderer: Renderer, cars: DrawCar[], dt: number) {
     }
   }
 }
+
+/** Front crush past which the engine bay starts making its own weather, m. */
+const SMOKING_NOSE = 0.12;
 
 function buildHudState(
   sim: Sim,
@@ -588,6 +609,9 @@ function buildHudState(
     speedKph: Math.hypot(f(F.vx), f(F.vy)) * 3.6,
     gear: has ? f(F.gear) : 1,
     rpm: f(F.rpm),
+    latG: f(F.ay) / 9.81,
+    damage:
+      Math.min(1, Math.max(f(F.dmgFront), f(F.dmgRear), f(F.dmgLeft), f(F.dmgRight)) / sim.consts.maxCrush),
     throttle: inp(0),
     brake: inp(2),
     steer: inp(1),
@@ -725,6 +749,8 @@ function offlineHud(renderer: Renderer): HudState {
     speedKph: 0,
     gear: 1,
     rpm: 0,
+    latG: 0,
+    damage: 0,
     throttle: 0,
     brake: 0,
     steer: 0,

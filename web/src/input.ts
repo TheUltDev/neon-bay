@@ -52,9 +52,17 @@ export class Controls {
    * `forwardSpeed` decides whether "down" means brake or reverse, which is why
    * the mapping lives on the client: whatever it decides is what gets sent, so
    * prediction and authority always agree on the meaning.
+   *
+   * `reverseBelow` is the gearbox's own threshold, read out of the physics
+   * rather than guessed at here, so the key stops meaning "brake" exactly where
+   * reverse becomes available. It used to hand over at 1.5 m/s, which left a
+   * window where the car was neither braking nor able to select reverse and
+   * simply coasted -- and the physics now brakes for anyone who asks for a
+   * direction they are not going in anyway, bots and gamepads included, so this
+   * is the fast path rather than the only one. See `car::reverse_assist`.
    */
-  read(forwardSpeed: number): Input {
-    const pad = this.readPad();
+  read(forwardSpeed: number, reverseBelow: number): Input {
+    const pad = this.readPad(forwardSpeed, reverseBelow);
     if (pad) {
       this.gamepadActive = true;
       return pad;
@@ -65,13 +73,13 @@ export class Controls {
     let throttle = this.held.has('up') ? 1 : 0;
     let brake = 0;
     if (this.held.has('down')) {
-      if (forwardSpeed > 1.5) brake = 1;
+      if (forwardSpeed > reverseBelow) brake = 1;
       else throttle = -1;
     }
     return { throttle, steer, brake, handbrake: this.held.has('handbrake') ? 1 : 0 };
   }
 
-  private readPad(): Input | null {
+  private readPad(forwardSpeed: number, reverseBelow: number): Input | null {
     const pads = navigator.getGamepads?.() ?? [];
     for (const p of pads) {
       if (!p) continue;
@@ -81,10 +89,16 @@ export class Controls {
       const hb = (p.buttons[0]?.pressed ? 1 : 0) || (p.buttons[5]?.pressed ? 1 : 0);
       const active = Math.abs(ax) > 0.12 || rt > 0.02 || lt > 0.02 || hb > 0;
       if (!active) continue;
+      // The left trigger is the brake, and at a standstill it is also reverse
+      // -- which is the arcade convention, and until now the pad had no way to
+      // reverse at all. The physics will not select reverse above walking pace
+      // whatever it is sent, so this cannot be a way to drive backwards at
+      // speed.
+      const backwards = lt > 0.15 && rt < 0.05 && forwardSpeed < reverseBelow;
       return {
-        throttle: rt,
+        throttle: backwards ? -lt : rt,
         steer: -deadzone(ax, 0.1),
-        brake: lt,
+        brake: backwards ? 0 : lt,
         handbrake: hb,
       };
     }

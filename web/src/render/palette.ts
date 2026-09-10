@@ -38,6 +38,86 @@ export const CAR_OUTLINE = [
   -2.1, 0.66, -1.65, 0.95, 1.55, 0.95, 2.1, 0.62,
 ] as const;
 
+/**
+ * The silhouette again, subdivided: every corner plus the midpoint of every
+ * edge, sixteen points.
+ *
+ * On an undamaged car this is the same shape -- a midpoint of a straight edge
+ * is on the edge -- which is the point of building it this way rather than
+ * drawing a second outline. What it buys is somewhere for a dent to go. Eight
+ * points can only be pulled inwards, which reads as a car that has shrunk;
+ * sixteen can pucker an edge in the middle and leave its ends where they were,
+ * which reads as one that has been hit.
+ */
+export const CAR_HULL_N = 16;
+export const CAR_HULL = (() => {
+  const h = new Float32Array(CAR_HULL_N * 2);
+  for (let i = 0; i < 8; i++) {
+    const j = (i + 1) % 8;
+    h[i * 4] = CAR_OUTLINE[i * 2];
+    h[i * 4 + 1] = CAR_OUTLINE[i * 2 + 1];
+    h[i * 4 + 2] = (CAR_OUTLINE[i * 2] + CAR_OUTLINE[j * 2]) / 2;
+    h[i * 4 + 3] = (CAR_OUTLINE[i * 2 + 1] + CAR_OUTLINE[j * 2 + 1]) / 2;
+  }
+  return h;
+})();
+
+/**
+ * How far each hull point is thrown off the fold, as a fraction of how deep the
+ * fold is there. Fixed, not random: a car's dents must not shimmer between
+ * frames, and every backend has to agree on the same wreck.
+ */
+const CREASE = [
+  0.31, -0.62, 0.18, 0.74, -0.45, 0.27, 0.66, -0.21,
+  -0.34, 0.58, -0.71, 0.15, 0.42, -0.5, -0.23, 0.69,
+] as const;
+
+/** Reused: one car's outline is built and consumed before the next one's. */
+const CRUSHED = new Float32Array(CAR_HULL_N * 2);
+
+/**
+ * [`CAR_HULL`] with the crush from `physics::damage` folded into it.
+ *
+ * Each point is pulled in by how much it *faces* each crushed face -- the
+ * square of its position along that axis, so a nose-on hit flattens the nose
+ * and leaves the doors alone, while a corner hit takes both. Then the fold is
+ * thrown sideways by [`CREASE`], because metal that has nowhere to go buckles
+ * rather than scaling.
+ *
+ * Returns a shared buffer. Draw with it before asking for another.
+ */
+export function crushOutline(front: number, rear: number, left: number, right: number): Float32Array {
+  for (let i = 0; i < CAR_HULL_N; i++) {
+    const x = CAR_HULL[i * 2];
+    const y = CAR_HULL[i * 2 + 1];
+    const fx = x / 2.1;
+    const fy = y / 0.95;
+    const sx = fx * fx;
+    const sy = fy * fy;
+    const dx = fx > 0 ? sx * front : -sx * rear;
+    const dy = fy > 0 ? sy * left : -sy * right;
+    const c = CREASE[i];
+    CRUSHED[i * 2] = x - dx + c * dy * 0.55;
+    CRUSHED[i * 2 + 1] = y - dy + c * dx * 0.6;
+  }
+  return CRUSHED;
+}
+
+/** Rear crush past which the wing is somewhere behind you on the track, m. */
+export const WING_LOST = 0.18;
+
+/**
+ * Whether the headlight on the `+y` (`side` 1) or `-y` (-1) corner is out.
+ *
+ * A nose has to be properly folded before a lamp goes, and it goes on the side
+ * that took the hit: `physics::damage` splits a corner impact between the front
+ * face and the side it came in on, so the two together say which corner.
+ */
+export function lampOut(front: number, left: number, right: number, side: 1 | -1): boolean {
+  if (front < 0.15) return false;
+  return side > 0 ? left >= right : right >= left;
+}
+
 /** Lighten (positive) or darken (negative) a `#rrggbb` string. */
 export function shade(hex: string, amount: number): string {
   const n = parseInt(hex.slice(1), 16);

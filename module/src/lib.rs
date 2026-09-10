@@ -146,6 +146,17 @@ pub struct Input {
 /// Authoritative pose. Written only by the sidecar, and the payload
 /// [`push_states`] carries: the sidecar sends whole rows, so there is no
 /// second copy of this shape to be kept in step with it.
+///
+/// Most of what follows is not pose at all -- it is the vehicle's internal
+/// state, and it is on the wire because rollback needs it. A client that
+/// rewinds to an authoritative tick and replays has to start from *exactly*
+/// the car the authority had: four wheels turning at their own speeds, four
+/// tires part way through building up their cornering force, a body part way
+/// through rolling, and an engine at some particular speed in some particular
+/// gear. Restore the position and velocity alone and the replay diverges
+/// within a few ticks, because the car it is replaying is not the same car.
+///
+/// See `physics/src/car.rs` for what each one means.
 #[table(accessor = car_state, public)]
 #[derive(Default)]
 pub struct CarState {
@@ -156,6 +167,7 @@ pub struct CarState {
     pub tick: u64,
     /// Last [`Input::seq`] from this car's owner that the sidecar had applied.
     pub ack_seq: u32,
+
     pub x: f32,
     pub y: f32,
     pub heading: f32,
@@ -163,13 +175,50 @@ pub struct CarState {
     pub vy: f32,
     pub omega: f32,
     pub steer: f32,
-    /// Filtered longitudinal acceleration. Cosmetically irrelevant, but the
-    /// integrator feeds it back into load transfer, so a client that rolls back
-    /// without it would re-simulate a subtly different car.
+
+    /// Wheel angular velocities, rad/s: front-left, front-right, rear-left,
+    /// rear-right. Slip ratio is computed from these, so wheelspin and lock-up
+    /// only replay correctly if they come across.
+    pub w_fl: f32,
+    pub w_fr: f32,
+    pub w_rl: f32,
+    pub w_rr: f32,
+
+    /// Lateral force each tire has built up so far. A carcass takes a
+    /// relaxation length to develop it, which makes it state and not output.
+    pub fy_fl: f32,
+    pub fy_fr: f32,
+    pub fy_rl: f32,
+    pub fy_rr: f32,
+
+    /// Body attitude and how fast it is changing. Load transfer lags the
+    /// driver's input through these, so they decide what grip each tire has.
+    pub roll: f32,
+    pub roll_rate: f32,
+    pub pitch: f32,
+    pub pitch_rate: f32,
+
+    /// Engine speed, rad/s.
+    pub engine: f32,
+    /// -1 reverse, 1..=6 forward.
+    pub gear: i8,
+    /// Seconds left of the current shift, during which the clutch is out.
+    pub shift: f32,
+    /// Clutch engagement, 0..1.
+    pub clutch: f32,
+
+    /// Body-frame acceleration. Feeds the instantaneous paths of load
+    /// transfer, so like `ax` before it, a client that rolled back without it
+    /// would re-simulate a subtly different car.
     pub ax: f32,
+    pub ay: f32,
+
+    /// Drives tire smoke and the tachometer. Not simulation state -- but the
+    /// browser never simulates anyone else's car, so without these the rest of
+    /// the field would drive around in silence with still needles.
     pub wheel_spin: f32,
     pub rpm: f32,
-    pub gear: u8,
+
     pub lap: u32,
     pub cp: u32,
     /// Distance around the current lap, for standings.
@@ -181,9 +230,23 @@ pub struct CarState {
     pub lap_start: f32,
     pub last_lap: f32,
     pub best_lap: f32,
+
     /// Collision impulse this tick, for hit effects.
     pub impact: f32,
     pub wall: bool,
+
+    /// Permanent crush on each face of the body, metres.
+    ///
+    /// Simulation state like the rest of this row, and the least optional part
+    /// of it: a damaged car has less downforce, less steering lock, less power
+    /// and less grip, so a client that rolled back without knowing about the
+    /// damage would replay a car that no longer exists. It is also what the
+    /// renderer bends the silhouette by, which is why a wreck looks like one
+    /// from every browser watching.
+    pub dmg_front: f32,
+    pub dmg_rear: f32,
+    pub dmg_left: f32,
+    pub dmg_right: f32,
 }
 
 /// Best laps. Aggregating these is bookkeeping, not simulation, so it belongs
@@ -526,8 +589,8 @@ fn config(ctx: &ReducerContext) -> Config {
         .expect("config row missing; module was not initialized")
 }
 
-/// The fence. Holding the right identity is not enough -- a sidecar that was
-/// replaced while it was away still has it -- so what is checked is the
+/// The fence. Holding the right identity is not enough, because a sidecar that
+/// was replaced while it was away still has it, so what is checked is the
 /// connection recorded by the winning [`claim_authority`].
 fn require_authority(ctx: &ReducerContext) -> Result<Config, String> {
     let cfg = config(ctx);

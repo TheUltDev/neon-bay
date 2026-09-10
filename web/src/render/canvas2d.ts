@@ -29,7 +29,10 @@
 
 import type { Sim } from '../sim';
 import { BaseRenderer, MARK_SIZE, TIRE_WIDTH } from './base';
-import { ASPHALT_TILE, asphaltPixels, CAR_OUTLINE, EDGE_GLOW, EDGE_RGB, shade, WHEELS } from './palette';
+import {
+  ASPHALT_TILE, asphaltPixels, CAR_HULL, CAR_HULL_N, crushOutline,
+  EDGE_GLOW, EDGE_RGB, lampOut, shade, WHEELS, WING_LOST,
+} from './palette';
 import type { DrawCar, GhostCar, RendererInfo } from './types';
 
 export class Canvas2DRenderer extends BaseRenderer {
@@ -57,6 +60,7 @@ export class Canvas2DRenderer extends BaseRenderer {
   private asphalt: CanvasPattern | null = null;
 
   // cached paint
+  /** Body gradients, keyed by colour and damage grade. */
   private bodyGrad = new Map<number, CanvasGradient>();
   private beamGrad: CanvasGradient | null = null;
   /** The backdrop, which changes only with the window. Building a radial
@@ -369,6 +373,14 @@ export class Canvas2DRenderer extends BaseRenderer {
   }
 
   private drawCar(ctx: CanvasRenderingContext2D, c: DrawCar) {
+    // The shape this car is *now*, which on an undamaged one is the shape
+    // every car has. Built before the transform because the crush is in the
+    // car's own frame, which is the frame everything below is drawn in.
+    const hull = crushOutline(c.dmgFront, c.dmgRear, c.dmgLeft, c.dmgRight);
+    // Paint does not survive an accident either. Quantised, so that a field of
+    // battered cars still shares a handful of cached gradients between them
+    // rather than building one per car per frame.
+    const grade = Math.round(c.damage * 4);
     const col = `#${c.color.toString(16).padStart(6, '0')}`;
     ctx.save();
     ctx.translate(c.x, c.y);
@@ -394,19 +406,21 @@ export class Canvas2DRenderer extends BaseRenderer {
     }
 
     // Body. The gradient is in the car's own frame, which is the same frame
-    // for every car, so one per colour is enough for the whole grid.
-    let g = this.bodyGrad.get(c.color);
+    // for every car, so one per colour and damage grade covers the whole grid.
+    const key = c.color * 8 + grade;
+    let g = this.bodyGrad.get(key);
     if (!g) {
+      const dirt = -0.09 * grade;
       g = ctx.createLinearGradient(0, -1, 0, 1);
-      g.addColorStop(0, shade(col, -0.35));
-      g.addColorStop(0.45, col);
-      g.addColorStop(1, shade(col, -0.55));
-      this.bodyGrad.set(c.color, g);
+      g.addColorStop(0, shade(col, -0.35 + dirt));
+      g.addColorStop(0.45, shade(col, dirt));
+      g.addColorStop(1, shade(col, -0.55 + dirt));
+      this.bodyGrad.set(key, g);
     }
     ctx.fillStyle = g;
     ctx.shadowColor = col;
     ctx.shadowBlur = c.isLocal ? 22 : 12;
-    carBody(ctx);
+    carBody(ctx, hull);
     ctx.fill();
     ctx.shadowBlur = 0;
 
@@ -416,16 +430,18 @@ export class Canvas2DRenderer extends BaseRenderer {
     ctx.fill();
     ctx.fillStyle = 'rgba(255,255,255,0.16)';
     ctx.fillRect(-1.9, -0.12, 3.4, 0.24);
-    // Rear wing.
-    ctx.fillStyle = shade(col, -0.6);
-    roundRect(ctx, -2.15, -0.95, 0.34, 1.9, 0.1);
-    ctx.fill();
+    // Rear wing, until something takes it off.
+    if (c.dmgRear < WING_LOST) {
+      ctx.fillStyle = shade(col, -0.6);
+      roundRect(ctx, -2.15, -0.95, 0.34, 1.9, 0.1);
+      ctx.fill();
+    }
 
-    // Lights.
+    // Lights. A folded nose takes the headlight on that corner with it.
     if (c.speed > 0.5 || c.throttle > 0) {
       ctx.fillStyle = 'rgba(255,244,214,0.95)';
-      ctx.fillRect(1.92, -0.78, 0.2, 0.4);
-      ctx.fillRect(1.92, 0.38, 0.2, 0.4);
+      if (!lampOut(c.dmgFront, c.dmgLeft, c.dmgRight, 1)) ctx.fillRect(1.92, -0.78, 0.2, 0.4);
+      if (!lampOut(c.dmgFront, c.dmgLeft, c.dmgRight, -1)) ctx.fillRect(1.92, 0.38, 0.2, 0.4);
       if (!this.beamGrad) {
         this.beamGrad = ctx.createLinearGradient(2.1, 0, 12, 0);
         this.beamGrad.addColorStop(0, 'rgba(255,240,200,0.13)');
@@ -452,7 +468,14 @@ export class Canvas2DRenderer extends BaseRenderer {
     if (c.isLocal) {
       ctx.strokeStyle = 'rgba(255,255,255,0.55)';
       ctx.lineWidth = 0.07;
-      carBody(ctx);
+      carBody(ctx, hull);
+      ctx.stroke();
+    }
+    // Buckled metal catches the light along the fold.
+    if (grade > 0) {
+      ctx.strokeStyle = `rgba(12,14,20,${0.2 + 0.13 * grade})`;
+      ctx.lineWidth = 0.06;
+      carBody(ctx, hull);
       ctx.stroke();
     }
     ctx.restore();
@@ -466,7 +489,7 @@ export class Canvas2DRenderer extends BaseRenderer {
     ctx.strokeStyle = 'rgba(120,255,214,0.75)';
     ctx.lineWidth = 0.09;
     ctx.setLineDash([0.45, 0.32]);
-    carBody(ctx);
+    carBody(ctx, CAR_HULL);
     ctx.stroke();
     ctx.setLineDash([]);
     ctx.fillStyle = 'rgba(120,255,214,0.9)';
@@ -557,11 +580,11 @@ export class Canvas2DRenderer extends BaseRenderer {
 
 // ------------------------------------------------------------------ utils --
 
-function carBody(ctx: CanvasRenderingContext2D) {
+function carBody(ctx: CanvasRenderingContext2D, pts: ArrayLike<number>) {
   ctx.beginPath();
-  for (let i = 0; i < CAR_OUTLINE.length; i += 2) {
-    const x = CAR_OUTLINE[i];
-    const y = CAR_OUTLINE[i + 1];
+  for (let i = 0; i < CAR_HULL_N; i++) {
+    const x = pts[i * 2];
+    const y = pts[i * 2 + 1];
     i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
   }
   ctx.closePath();

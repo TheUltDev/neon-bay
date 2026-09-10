@@ -9,8 +9,10 @@
 //!   other cars at their interpolated network positions, so you can still lean
 //!   on a rival mid-corner without the client ever claiming to own their state.
 
-use crate::car::{self, CarInput, CarState, CIRCLE_OFF, CIRCLE_R, INV_MASS, IZ, MASS};
-use crate::math::{abs, clamp, signum, V2};
+use crate::car::{self, CarInput, CarState, BOUND_R, HALF_LEN, HALF_WID, INV_MASS, IZ, MASS};
+use crate::collide::{self, Body, Constraint, Manifold, Obb};
+use crate::damage::{self, Damage};
+use crate::math::{abs, signum, V2};
 use crate::track::{Track, CHECKPOINTS, NO_HINT};
 
 pub const MAX_CARS: usize = 24;
@@ -33,11 +35,35 @@ fn slots(mut bits: u32) -> impl Iterator<Item = usize> {
     })
 }
 
-/// Restitution against the barriers. Low: walls eat your speed.
-const WALL_RESTITUTION: f32 = 0.26;
-/// Restitution car vs car. Higher: contact is bouncy and readable.
-const CAR_RESTITUTION: f32 = 0.42;
-const WALL_FRICTION: f32 = 0.55;
+/// How much each surface springs back, as a multiple of what bending sheet
+/// metal gives back on its own.
+///
+/// The *speed* dependence belongs to the crush model and not to these -- see
+/// [`crate::damage::restitution`], where a hard hit is nearly plastic because
+/// the energy went into the shape of the car rather than back into its
+/// velocity. All these two say is that a barrier keeps rather more of a hit
+/// than another car's flank does.
+const WALL_BOUNCE: f32 = 0.7;
+const CAR_BOUNCE: f32 = 1.0;
+/// Coulomb friction at a contact.
+///
+/// The barrier is steel and is meant to be slippery -- guiding a car back onto
+/// the road rather than catching it is the entire reason it is shaped like
+/// that -- but it is not frictionless, and what is left is enough to spin a car
+/// that arrives at an angle. It came down from 0.55 when contacts started being
+/// solved every substep: a barrier used to flick a car that leant on it away
+/// once a tick, which is not a thing barriers do, and with that artifact gone
+/// the friction that had been tuned around it pinned cars against the wall.
+///
+/// Panel on panel is the other way round. It used to be far slipperier than
+/// this, which turned every side-by-side moment into a clean reflection; real
+/// bodywork catches on the car it is rubbing, and that is what makes contact
+/// scrub speed off both of them rather than exchange it.
+const WALL_FRICTION: f32 = 0.40;
+const CAR_FRICTION: f32 = 0.65;
+/// Ceiling on the spin a contact may leave behind, rad/s. A car caught between
+/// a barrier and another car can otherwise be handed a whole revolution.
+const MAX_SPIN: f32 = 6.0;
 
 pub struct World {
     pub track: Track,
@@ -118,7 +144,15 @@ impl World {
         }
     }
 
-    /// Drop a car back on the racing line where it is, pointing the right way.
+    /// Drop a car back on the racing line where it is, pointing the right way,
+    /// and straight: [`CarState::place`] repairs the bodywork.
+    ///
+    /// A deliberate call rather than a physical one. This is the button a
+    /// driver presses when they are wedged somewhere facing a barrier, and
+    /// making them serve the rest of the race in the car that got them there
+    /// would turn one bad corner into a retirement. Completing a lap repairs a
+    /// car too, in [`World::update_progress`] -- this is the same repair for
+    /// somebody who is not going to reach the line.
     pub fn respawn_in_place(&mut self, i: usize) {
         if !self.is_active(i) {
             return;
@@ -152,25 +186,64 @@ impl World {
             self.cars[i].wall = 0.0;
         }
 
+        // Where the barrier is under each corner of each car. Sampled once --
+        // see [`Barrier`] for why that is enough for a whole tick.
+        let mut barrier = [[Barrier::default(); 4]; MAX_CARS];
+        for i in slots(mask) {
+            barrier[i] = self.sample_barriers(i);
+        }
+
+        // How fast the cars this process does *not* own are travelling, for the
+        // length of this tick, so that being hit can change it.
+        //
+        // Their state is not ours to write and stays exactly as it was; this is
+        // a scratch copy that lives for one tick and is thrown away. Without it
+        // a client hits a rival that never reacts, and the same contact fires
+        // again on every one of the eight substeps, each pass pulling the local
+        // car further towards a velocity the rival is no longer travelling at.
+        // With it the contact is over after the substep that resolved it, which
+        // is what happens on the authority.
+        //
+        // Worth measuring rather than assuming: while the rival's pose is
+        // current it is worth nothing at all, because a nearly plastic impact
+        // leaves two equal cars at the same speed and the snapshot is already
+        // showing it. It earns its keep when the pose is stale -- 10.7 m/s of
+        // error against 13.0 at a three-tick-old snapshot and 30 m/s of closing
+        // speed -- which is the condition this has to survive.
+        let mut ghost = [(V2::ZERO, 0.0f32); MAX_CARS];
+        for i in slots(self.active & !mask) {
+            ghost[i] = (self.cars[i].vel(), self.cars[i].omega);
+        }
+
+        // Dynamics and contacts advance together.
+        //
+        // Contacts used to be resolved once, after all eight substeps had run.
+        // That put the tires on a 480 Hz clock and the panels on a 60 Hz one,
+        // and it showed: two cars closing at 30 m/s were already half a metre
+        // into each other before anything was done about it, and half a metre
+        // in, the shallowest separating axis is not reliably the one you drove
+        // in along. Solving them at the same rate costs a broad-phase test per
+        // pair per substep and bounds the deepest overlap by the distance a car
+        // covers in one, which is centimetres.
         for _ in 0..car::SUBSTEPS {
             for i in slots(mask) {
                 let input = self.inputs[i];
                 car::integrate(&mut self.cars[i], &input, car::H);
             }
-        }
 
-        for i in slots(mask) {
-            self.resolve_walls(i);
-        }
+            for i in slots(mask) {
+                self.resolve_walls(i, &barrier[i]);
+            }
 
-        // Fixed pair order keeps the result independent of iteration whims.
-        // Both ends have to be live and at least one of them has to be moving.
-        for i in slots(self.active) {
-            for j in slots(self.active & !((2 << i) - 1)) {
-                let a = mask & (1 << i) != 0;
-                let b = mask & (1 << j) != 0;
-                if a || b {
-                    self.resolve_pair(i, j, a, b);
+            // Fixed pair order keeps the result independent of iteration whims.
+            // Both ends have to be live and at least one has to be moving.
+            for i in slots(self.active) {
+                for j in slots(self.active & !((2 << i) - 1)) {
+                    let a = mask & (1 << i) != 0;
+                    let b = mask & (1 << j) != 0;
+                    if a || b {
+                        self.resolve_pair(i, j, a, b, &mut ghost);
+                    }
                 }
             }
         }
@@ -180,150 +253,160 @@ impl World {
         }
     }
 
-    /// Push a car back inside the barriers, once per body circle so that
-    /// clipping a wall with the nose spins you the way it should.
-    fn resolve_walls(&mut self, i: usize) {
-        let mut car = self.cars[i];
+    /// Sample the barrier under each of a car's four corners, in the order
+    /// [`Obb::corners`] returns them.
+    fn sample_barriers(&self, i: usize) -> [Barrier; 4] {
+        let car = self.cars[i];
+        let body = Obb::new(car.pos(), car.heading, HALF_LEN, HALF_WID);
         let hint = car.seg as u16;
-        let fwd = V2::from_angle(car.heading);
-
-        for k in 0..2 {
-            let off = if k == 0 { CIRCLE_OFF } else { -CIRCLE_OFF };
-            let cp = car.pos().add(fwd.scale(off));
-            let hit = self.track.nearest(cp, hint);
-            let limit = hit.half_width - CIRCLE_R;
-            let d = hit.lat;
-            if abs(d) <= limit {
-                continue;
-            }
-
-            let pen = abs(d) - limit;
-            // Inward normal: back toward the centerline.
-            let n = hit.normal.scale(-signum(d));
-
-            car.x += n.x * pen;
-            car.y += n.y * pen;
-            car.wall = 1.0;
-
-            // Contact point relative to the CG, after the correction.
-            let r = car.pos().add(fwd.scale(off)).sub(car.pos());
-            // Velocity of the contact point, v + omega x r.
-            let vpt = V2::new(
-                car.vx - car.omega * r.y,
-                car.vy + car.omega * r.x,
-            );
-            let vn = vpt.dot(n);
-            if vn >= 0.0 {
-                continue;
-            }
-            let rxn = r.cross(n);
-            let denom = INV_MASS + rxn * rxn / IZ;
-            let jn = -(1.0 + WALL_RESTITUTION) * vn / denom;
-
-            // Scrub friction along the wall, capped by the normal impulse.
-            let t = n.perp();
-            let vt = vpt.dot(t);
-            let rxt = r.cross(t);
-            let denom_t = INV_MASS + rxt * rxt / IZ;
-            let mut jt = -vt / denom_t * WALL_FRICTION;
-            let cap = jn * 0.85;
-            jt = clamp(jt, -cap, cap);
-
-            let imp = n.scale(jn).add(t.scale(jt));
-            car.vx += imp.x * INV_MASS;
-            car.vy += imp.y * INV_MASS;
-            car.omega += r.cross(imp) / IZ;
-            car.impact += abs(jn) + abs(jt) * 0.5;
+        let mut out = [Barrier::default(); 4];
+        for (k, corner) in body.corners().iter().enumerate() {
+            let hit = self.track.nearest(*corner, hint);
+            // Outward: away from the centreline, on the side this corner is.
+            let n = hit.normal.scale(signum(hit.lat));
+            out[k] = Barrier {
+                out: n,
+                d: (abs(hit.lat) - hit.half_width) - corner.dot(n),
+            };
         }
-
-        self.cars[i] = car;
+        out
     }
 
-    /// Circle-vs-circle body contact. `a_dyn`/`b_dyn` say which cars may move;
-    /// a static car acts as infinite mass.
-    fn resolve_pair(&mut self, i: usize, j: usize, a_dyn: bool, b_dyn: bool) {
-        // Cheap reject on the bounding radius of the whole body.
-        let da = self.cars[i].pos().sub(self.cars[j].pos());
-        let reach = CIRCLE_OFF + CIRCLE_R;
-        if da.len_sq() > (2.0 * reach) * (2.0 * reach) {
+    /// Push a car back inside the barriers.
+    ///
+    /// Each of the four corners is tested against the plane [`sample_barriers`]
+    /// found under it. A car broadside into a wall reports two corners and gets
+    /// a flat, stable contact; one that clips it with a front corner reports
+    /// one, and spins.
+    fn resolve_walls(&mut self, i: usize, bar: &[Barrier; 4]) {
+        let car = self.cars[i];
+        let body = Obb::new(car.pos(), car.heading, HALF_LEN, HALF_WID);
+
+        let mut m = Manifold::default();
+        for (k, corner) in body.corners().iter().enumerate() {
+            let pen = bar[k].depth(*corner);
+            if pen <= 0.0 {
+                continue;
+            }
+            // Inward normal: back towards the centerline.
+            m.push(*corner, bar[k].out.scale(-1.0), pen);
+        }
+        if m.count == 0 {
             return;
         }
 
-        let mut a = self.cars[i];
-        let mut b = self.cars[j];
-        let fa = V2::from_angle(a.heading);
-        let fb = V2::from_angle(b.heading);
+        let mut a = Body {
+            pos: car.pos(),
+            vel: car.vel(),
+            omega: car.omega,
+            inv_m: INV_MASS,
+            inv_i: 1.0 / IZ,
+        };
+        let mut wall = Body::fixed(car.pos());
+        collide::prepare(&a, &wall, m.as_slice_mut(), WALL_BOUNCE);
+        let hit = collide::solve(&mut a, &mut wall, m.as_slice_mut(), WALL_FRICTION);
+        collide::separate(&mut a, &mut wall, m.as_slice());
 
-        for ka in 0..2 {
-            for kb in 0..2 {
-                let oa = if ka == 0 { CIRCLE_OFF } else { -CIRCLE_OFF };
-                let ob = if kb == 0 { CIRCLE_OFF } else { -CIRCLE_OFF };
-                let pa = a.pos().add(fa.scale(oa));
-                let pb = b.pos().add(fb.scale(ob));
-                let delta = pa.sub(pb);
-                let dist = delta.len();
-                let min_d = 2.0 * CIRCLE_R;
-                if dist >= min_d || dist < 1e-4 {
-                    continue;
-                }
+        let car = &mut self.cars[i];
+        car.x = a.pos.x;
+        car.y = a.pos.y;
+        car.vx = a.vel.x;
+        car.vy = a.vel.y;
+        car.omega = collide::clamp_spin(a.omega, MAX_SPIN);
+        car.wall = 1.0;
+        car.impact += hit.severity();
+        crush(car, m.as_slice(), &hit, damage::SHARE_WALL, 1.0);
+    }
 
-                let n = delta.scale(1.0 / dist);
-                let pen = min_d - dist;
-
-                // Positional correction, shared by whoever is allowed to move.
-                let (wa, wb) = match (a_dyn, b_dyn) {
-                    (true, true) => (0.5, 0.5),
-                    (true, false) => (1.0, 0.0),
-                    (false, true) => (0.0, 1.0),
-                    (false, false) => continue,
-                };
-                a.x += n.x * pen * wa;
-                a.y += n.y * pen * wa;
-                b.x -= n.x * pen * wb;
-                b.y -= n.y * pen * wb;
-
-                let ra = pa.sub(a.pos());
-                let rb = pb.sub(b.pos());
-                let va = V2::new(a.vx - a.omega * ra.y, a.vy + a.omega * ra.x);
-                let vb = V2::new(b.vx - b.omega * rb.y, b.vy + b.omega * rb.x);
-                let rel = va.sub(vb).dot(n);
-                if rel >= 0.0 {
-                    continue;
-                }
-
-                let rxa = ra.cross(n);
-                let rxb = rb.cross(n);
-                let inv_a = if a_dyn { INV_MASS } else { 0.0 };
-                let inv_b = if b_dyn { INV_MASS } else { 0.0 };
-                let ia = if a_dyn { rxa * rxa / IZ } else { 0.0 };
-                let ib = if b_dyn { rxb * rxb / IZ } else { 0.0 };
-                let denom = inv_a + inv_b + ia + ib;
-                if denom < 1e-6 {
-                    continue;
-                }
-                let jn = -(1.0 + CAR_RESTITUTION) * rel / denom;
-                let imp = n.scale(jn);
-
-                if a_dyn {
-                    a.vx += imp.x * INV_MASS;
-                    a.vy += imp.y * INV_MASS;
-                    a.omega += ra.cross(imp) / IZ;
-                    a.impact += abs(jn);
-                }
-                if b_dyn {
-                    b.vx -= imp.x * INV_MASS;
-                    b.vy -= imp.y * INV_MASS;
-                    b.omega -= rb.cross(imp) / IZ;
-                    b.impact += abs(jn);
-                }
-            }
+    /// Body-vs-body contact between two cars. `a_dyn`/`b_dyn` say which of them
+    /// this process owns; the other one's *position* is not ours to move, and
+    /// its velocity is borrowed from `ghost` for the length of the tick.
+    fn resolve_pair(
+        &mut self,
+        i: usize,
+        j: usize,
+        a_dyn: bool,
+        b_dyn: bool,
+        ghost: &mut [(V2, f32); MAX_CARS],
+    ) {
+        // Cheap reject on the bounding radius of the whole body, before the
+        // separating-axis test earns its keep.
+        let apart = self.cars[i].pos().sub(self.cars[j].pos());
+        if apart.len_sq() > (2.0 * BOUND_R) * (2.0 * BOUND_R) {
+            return;
         }
 
-        // Angular velocity can run away in a multi-contact pile-up.
-        a.omega = clamp(a.omega, -6.0, 6.0);
-        b.omega = clamp(b.omega, -6.0, 6.0);
-        self.cars[i] = a;
-        self.cars[j] = b;
+        let ca = self.cars[i];
+        let cb = self.cars[j];
+        let oa = Obb::new(ca.pos(), ca.heading, HALF_LEN, HALF_WID);
+        let ob = Obb::new(cb.pos(), cb.heading, HALF_LEN, HALF_WID);
+        let mut m = match collide::box_box(&oa, &ob) {
+            Some(m) => m,
+            None => return,
+        };
+
+        // Both cars weigh what they weigh, whether or not this process owns
+        // them.
+        //
+        // A car this process may not *move* is not a car that weighs nothing,
+        // and the two are easy to confuse. The browser simulates only the local
+        // car, so it used to hand every rival infinite mass -- and an infinite
+        // mass returns the whole impulse, so you rebounded off a car you should
+        // have shoved out of the way. Giving the other car its real mass and
+        // then discarding its half of the answer costs nothing, because the
+        // authority's answer for that car is already in flight, and it makes
+        // the impulse the client predicts *for itself* the one the sidecar
+        // computed rather than one that happens to land nearby.
+        //
+        // How much that is worth depends entirely on how fresh the rival's pose
+        // is, and it is worth saying so: with it predicted onto the current
+        // tick the two treatments agree to a few hundredths, because a plastic
+        // impact leaves two equal cars at the same speed either way. Against a
+        // rival six ticks old at 20 m/s of closing speed, real mass is 9.4 m/s
+        // and 3.97 m out where infinite mass is 10.2 m/s and 4.13 m.
+        let (va, wa) = if a_dyn { (ca.vel(), ca.omega) } else { ghost[i] };
+        let (vb, wb) = if b_dyn { (cb.vel(), cb.omega) } else { ghost[j] };
+        let mut a = Body { pos: ca.pos(), vel: va, omega: wa, inv_m: INV_MASS, inv_i: 1.0 / IZ };
+        let mut b = Body { pos: cb.pos(), vel: vb, omega: wb, inv_m: INV_MASS, inv_i: 1.0 / IZ };
+
+        collide::prepare(&a, &b, m.as_slice_mut(), CAR_BOUNCE);
+        let hit = collide::solve(&mut a, &mut b, m.as_slice_mut(), CAR_FRICTION);
+
+        // Pushing overlapping bodies apart, on the other hand, is a numerical
+        // repair and not a force -- so it may only move a car this process owns,
+        // and a client that owns one of the two therefore takes all of it.
+        a.inv_m = if a_dyn { INV_MASS } else { 0.0 };
+        b.inv_m = if b_dyn { INV_MASS } else { 0.0 };
+        collide::separate(&mut a, &mut b, m.as_slice());
+
+        if a_dyn {
+            let car = &mut self.cars[i];
+            car.x = a.pos.x;
+            car.y = a.pos.y;
+            car.vx = a.vel.x;
+            car.vy = a.vel.y;
+            car.omega = collide::clamp_spin(a.omega, MAX_SPIN);
+            car.impact += hit.severity();
+            crush(car, m.as_slice(), &hit, damage::SHARE_CAR, 1.0);
+        }
+        if b_dyn {
+            let car = &mut self.cars[j];
+            car.x = b.pos.x;
+            car.y = b.pos.y;
+            car.vx = b.vel.x;
+            car.vy = b.vel.y;
+            car.omega = collide::clamp_spin(b.omega, MAX_SPIN);
+            car.impact += hit.severity();
+            crush(car, m.as_slice(), &hit, damage::SHARE_CAR, -1.0);
+        }
+        // What the hit did to a car we do not own, remembered until the end of
+        // the tick and no longer. The next snapshot is the truth about it.
+        if !a_dyn {
+            ghost[i] = (a.vel, collide::clamp_spin(a.omega, MAX_SPIN));
+        }
+        if !b_dyn {
+            ghost[j] = (b.vel, collide::clamp_spin(b.omega, MAX_SPIN));
+        }
     }
 
     /// Track position, checkpoint order and lap timing.
@@ -376,9 +459,97 @@ impl World {
             }
             car.lap += 1.0;
             car.lap_start = self.tick as f32;
+            // And a fresh car to start it in.
+            //
+            // The start/finish straight is where a pit lane would be, and this
+            // circuit does not have one, so completing a lap is the stop you
+            // never had to make. Without it damage is a one-way ratchet: the
+            // *Respawn* button repairs a car, but a bot has no thumbs and a
+            // driver who has not found the button spends the rest of the race
+            // in whatever they made of the first corner. A lap is the right
+            // clock for it -- long enough that a shunt is something you have to
+            // drive around for the best part of a minute, short enough that
+            // nobody is stuck with one forever.
+            car.set_damage(&Damage::default());
         }
     }
 
+}
+
+/// The barrier under one corner of a car, as a plane.
+///
+/// The track edge is a moving wall -- it is wherever the centreline says it is
+/// -- so there is no polygon to intersect, only a query. That query walks 49
+/// centreline samples per corner and is the most expensive thing a tick does,
+/// which is why it happens once a tick and the contact it feeds happens eight
+/// times.
+///
+/// Sampling it that rarely is not an approximation of much. The barrier is
+/// piecewise straight, a car covers about a metre in a whole tick at racing
+/// speed, and over that metre the plane a corner is measured against is the
+/// same plane. What moves inside the tick is the car, and the car is measured
+/// against it every substep.
+#[derive(Clone, Copy, Default)]
+struct Barrier {
+    /// Outward unit normal: away from the centreline, into the wall.
+    out: V2,
+    /// Plane offset, so `p . out + d` is how far `p` is past the barrier.
+    d: f32,
+}
+
+impl Barrier {
+    #[inline]
+    fn depth(&self, p: V2) -> f32 {
+        p.dot(self.out) + self.d
+    }
+}
+
+/// Turn the energy a contact destroyed into residual crush on the faces of the
+/// car that absorbed it.
+///
+/// `push` is +1 for the car the manifold's normals point towards and -1 for the
+/// other one, which is the direction each was shoved. The face that took the
+/// hit is the one the shove came through, so a contact square on the nose
+/// crushes only the nose, and one that came in at an angle splits its energy
+/// between two faces by the *squares* of the normal's components -- which sum
+/// to one, so a corner impact invents nothing and loses nothing.
+///
+/// The two kinds of energy the contact reports travel the same route and land
+/// on the same faces; what differs is how far they are allowed to fold them.
+fn crush(car: &mut CarState, cs: &[Constraint], hit: &collide::Impact, share: f32, push: f32) {
+    let folding = hit.crush * share;
+    let sliding = hit.scrape * share;
+    if folding <= 0.0 && sliding <= 0.0 {
+        return;
+    }
+    let mut total = 0.0;
+    for c in cs {
+        total += c.impulse();
+    }
+    if total <= 1e-3 {
+        return;
+    }
+    let mut d = car.damage();
+    for c in cs {
+        let part = c.impulse() / total;
+        if part <= 0.0 {
+            continue;
+        }
+        // Which way this car was pushed, in its own frame.
+        let n = c.normal.scale(push).to_local(car.heading);
+        let (wx, wy) = (part * n.x * n.x, part * n.y * n.y);
+        if n.x < 0.0 {
+            d.front = damage::scuff(damage::accumulate(d.front, folding * wx), sliding * wx);
+        } else {
+            d.rear = damage::scuff(damage::accumulate(d.rear, folding * wx), sliding * wx);
+        }
+        if n.y < 0.0 {
+            d.left = damage::scuff(damage::accumulate(d.left, folding * wy), sliding * wy);
+        } else {
+            d.right = damage::scuff(damage::accumulate(d.right, folding * wy), sliding * wy);
+        }
+    }
+    car.set_damage(&d);
 }
 
 /// Total simulated distance, used by the tests as a coarse determinism hash.

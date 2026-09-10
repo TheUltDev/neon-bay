@@ -42,9 +42,14 @@ const BOT_COLORS: [u32; 24] = [
 /// Rebuild the simulation's view of a car from a published row. The inverse of
 /// the mapping in [`Authority::publish`].
 ///
-/// The four fields left at their default -- `slip_f`, `slip_r`, `impact`,
-/// `wall` -- are the ones not on the wire. Each is overwritten before it is
-/// next read, so resuming without them is exact rather than approximate.
+/// The fields left at their default -- `slip_f`, `slip_r`, `impact`, `wall` --
+/// are the ones not on the wire. Each is overwritten before it is next read, so
+/// resuming without them is exact rather than approximate.
+///
+/// Everything else is: a car is four wheels, four tires part way through
+/// building up their forces, a body part way through rolling, and an engine at
+/// a particular speed in a particular gear. A sidecar taking over mid-race has
+/// to inherit all of it or the field jolts as it adopts them.
 fn from_row(r: &CarState) -> PhysicsCar {
     PhysicsCar {
         x: r.x,
@@ -54,10 +59,26 @@ fn from_row(r: &CarState) -> PhysicsCar {
         vy: r.vy,
         omega: r.omega,
         steer: r.steer,
+        w_fl: r.w_fl,
+        w_fr: r.w_fr,
+        w_rl: r.w_rl,
+        w_rr: r.w_rr,
+        fy_fl: r.fy_fl,
+        fy_fr: r.fy_fr,
+        fy_rl: r.fy_rl,
+        fy_rr: r.fy_rr,
+        roll: r.roll,
+        roll_rate: r.roll_rate,
+        pitch: r.pitch,
+        pitch_rate: r.pitch_rate,
+        engine: r.engine,
+        gear: r.gear as f32,
+        shift: r.shift,
+        clutch: r.clutch,
         ax: r.ax,
+        ay: r.ay,
         wheel_spin: r.wheel_spin,
         rpm: r.rpm,
-        gear: r.gear as f32,
         s: r.s,
         lat: r.lat,
         seg: r.seg as f32,
@@ -66,6 +87,10 @@ fn from_row(r: &CarState) -> PhysicsCar {
         lap_start: r.lap_start,
         last_lap: r.last_lap,
         best_lap: r.best_lap,
+        dmg_front: r.dmg_front,
+        dmg_rear: r.dmg_rear,
+        dmg_left: r.dmg_left,
+        dmg_right: r.dmg_right,
         active: 1.0,
         ..Default::default()
     }
@@ -410,10 +435,26 @@ impl Authority {
                 vy: c.vy,
                 omega: c.omega,
                 steer: c.steer,
+                w_fl: c.w_fl,
+                w_fr: c.w_fr,
+                w_rl: c.w_rl,
+                w_rr: c.w_rr,
+                fy_fl: c.fy_fl,
+                fy_fr: c.fy_fr,
+                fy_rl: c.fy_rl,
+                fy_rr: c.fy_rr,
+                roll: c.roll,
+                roll_rate: c.roll_rate,
+                pitch: c.pitch,
+                pitch_rate: c.pitch_rate,
+                engine: c.engine,
+                gear: c.gear as i8,
+                shift: c.shift,
+                clutch: c.clutch,
                 ax: c.ax,
+                ay: c.ay,
                 wheel_spin: c.wheel_spin,
                 rpm: c.rpm,
-                gear: c.gear as u8,
                 lap: c.lap as u32,
                 cp: c.cp as u32,
                 s: c.s,
@@ -424,6 +465,10 @@ impl Authority {
                 best_lap: c.best_lap,
                 impact: c.impact,
                 wall: c.wall > 0.5,
+                dmg_front: c.dmg_front,
+                dmg_rear: c.dmg_rear,
+                dmg_left: c.dmg_left,
+                dmg_right: c.dmg_right,
             });
         }
         // An empty grid still publishes, because this call is also the lease's

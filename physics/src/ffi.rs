@@ -2,7 +2,7 @@
 //!
 //! Deliberately a bare C ABI over `f32` buffers -- no wasm-bindgen, no
 //! wasm-pack, no npm plugin. `cargo build --target wasm32-unknown-unknown` emits
-//! a ~40 KB `.wasm` that the client loads with `WebAssembly.instantiate`.
+//! a ~54 KB `.wasm` that the client loads with `WebAssembly.instantiate`.
 //!
 //! Car state and inputs are handed to JavaScript as raw pointers into wasm
 //! linear memory. Since [`CarState`] is `#[repr(C)]` and entirely `f32`, the
@@ -83,6 +83,11 @@ fn constants(t: &Track) -> Vec<f32> {
         CHECKPOINTS as f32,
         MAX_CARS as f32,
         CAR_FLOATS as f32,
+        // Appended, not inserted: the client reads these by index, so a new
+        // constant may only ever go on the end.
+        crate::wheel::RADIUS,
+        crate::drivetrain::REVERSE_BELOW,
+        crate::damage::MAX_CRUSH,
     ]
 }
 
